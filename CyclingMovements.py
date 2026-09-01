@@ -1,0 +1,1453 @@
+import os
+import re
+import glob
+import time
+from pathlib import Path
+from datetime import date, datetime, timedelta, timezone
+
+import numpy as np
+import requests
+from PIL import Image
+import geopandas as gpd
+import pandas as pd
+
+# Forceer de non-interactieve Agg-backend VOORDAT pyplot wordt
+# geïmporteerd. Zonder dit kan matplotlib een GUI-backend (TkAgg/
+# QtAgg) pakken waarvan de canvas-pixelgrootte mede wordt bepaald
+# door de Windows-schermschaling (devicePixelRatio). Dat geeft
+# inconsistente, niet-proportionele output-resoluties zodra je de
+# dpi verhoogt. Met Agg is de canvas-grootte altijd exact
+# figsize * dpi, ongeacht schermschaling.
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.widgets import RectangleSelector
+import contextily as ctx
+import imageio.v2 as imageio
+
+from fitparse import FitFile
+from fit2gpx import Converter
+import gpxpy
+import gpxpy.gpx
+
+
+class CyclingMovementRenderer:
+    """
+    Rendert een animatie van fietsroutes (LineStrings) bovenop een basemap,
+    door elk frame als JPG weg te schrijven en die daarna met ffmpeg
+    samen te voegen tot een video.
+
+    Optioneel kan deze klasse ook zelf de bron-data verzamelen:
+      1) download_tredict_cycling_activities() haalt .fit/.tcx bestanden
+         op van Tredict (zie tredict_call.py).
+      2) convert_fit_folder_to_gpx() zet .fit bestanden om naar .gpx
+         (zie FittoGPXwithCheck.py), en filtert daarbij alleen
+         fietsactiviteiten.
+      3) sync_from_tredict() doet beide stappen achter elkaar en zet
+         self.data_source meteen op de resulterende gpx-map.
+      4) sync_from_strava() haalt fietsactiviteiten rechtstreeks op
+         via de Strava API (OAuth) en bouwt daar zelf .gpx bestanden
+         van, via de activity-streams endpoint (lat/lon/hoogte/tijd).
+    """
+
+    # Fiets-gerelateerde sporttypes zoals ze in FIT-bestanden voorkomen
+    CYCLING_FIT_SPORTS = {
+        "cycling",
+        "road_cycling",
+        "bike",
+        "biking",
+        "ride",
+    }
+
+    # Fiets-gerelateerde activity-types/sport-types zoals Strava ze teruggeeft
+    STRAVA_CYCLING_TYPES = {
+        "Ride",
+        "VirtualRide",
+        "EBikeRide",
+        "Handcycle",
+        "Velomobile",
+    }
+
+    def __init__(
+        self,
+        data_source,
+        api_key,
+        extent,
+        output_video="cycling_movement2.mp4",
+        frames_dir="frames",
+        fps=25,
+        max_duration=30,
+        dpi=100,
+        figsize=(16.97, 12),
+        zoom=12,
+        ffmpeg_path=None,
+        # ---- Tredict / FIT->GPX instellingen (optioneel) ----
+        tredict_token=None,
+        tredict_base_url="https://www.tredict.com/api/oauth/v2",
+        tredict_page_size=1000,
+        tredict_request_delay=0.25,
+        tredict_max_retries=4,
+        fit_dir="Activities_fit",
+        # ---- Strava API instellingen (optioneel) ----
+        strava_client_id=None,
+        strava_client_secret=None,
+        strava_refresh_token=None,
+        strava_base_url="https://www.strava.com/api/v3",
+        strava_page_size=200,
+        strava_request_delay=0.5,
+        strava_max_retries=4,
+    ):
+        """
+        data_source kan zijn:
+          - een pad naar een geojson-bestand
+          - een pad naar een geopackage (.gpkg) bestand
+          - een pad naar een map met .gpx bestanden
+
+        api_key: Thunderforest API key. Laat deze leeg ("" of None)
+        om automatisch terug te vallen op de gratis OpenStreetMap
+        (Mapnik) tileserver als achtergrondkaart, zowel bij de video
+        (setup_figure) als bij de poster-export (export_a0_map).
+
+        ffmpeg_path is optioneel: build_video() gebruikt standaard de
+        ffmpeg-binary die imageio-ffmpeg zelf meelevert (pip install
+        imageio-ffmpeg), dus je hoeft normaal geen los ffmpeg-pad meer
+        op te geven. Zet ffmpeg_path alleen als je expliciet een
+        andere/specifieke ffmpeg-installatie wil forceren.
+
+        tredict_token is optioneel en alleen nodig als je
+        download_tredict_cycling_activities() / sync_from_tredict()
+        gebruikt. Geef hem liever mee via een environment variable
+        (bv. os.environ["TREDICT_TOKEN"]) dan hardcoded in je script.
+
+        fit_dir is de map waar gedownloade .fit/.tcx bestanden van
+        Tredict worden opgeslagen, voordat ze naar gpx worden omgezet.
+
+        strava_client_id / strava_client_secret / strava_refresh_token
+        zijn optioneel en alleen nodig als je
+        download_strava_cycling_activities() / sync_from_strava()
+        gebruikt. Deze horen bij een Strava API-applicatie (aan te
+        maken via https://www.strava.com/settings/api); de
+        refresh_token haal je één keer op via
+        exchange_strava_authorization_code() (zie die docstring).
+        Geef ze liever mee via environment variables dan hardcoded in
+        je script. Vereist het pakket 'stravalib' (pip install
+        stravalib) voor de OAuth-token-uitwisseling.
+        """
+        self.data_source = data_source
+        self.ffmpeg_path = ffmpeg_path
+        self.api_key = api_key
+        self.xmin, self.ymin, self.xmax, self.ymax = extent
+        self.output_video = output_video
+        self.frames_dir = frames_dir
+        self.fps = fps
+        self.max_duration = max_duration
+        self.dpi = dpi
+        self.figsize = figsize
+        self.zoom = zoom
+
+        # Tredict / FIT->GPX
+        self.tredict_token = tredict_token
+        self.tredict_base_url = tredict_base_url
+        self.tredict_page_size = tredict_page_size
+        self.tredict_request_delay = tredict_request_delay
+        self.tredict_max_retries = tredict_max_retries
+        self.fit_dir = fit_dir
+        self._tredict_session = None
+        self._fit_converter = None
+
+        # Strava API
+        self.strava_client_id = strava_client_id
+        self.strava_client_secret = strava_client_secret
+        self.strava_refresh_token = strava_refresh_token
+        self.strava_base_url = strava_base_url
+        self.strava_page_size = strava_page_size
+        self.strava_request_delay = strava_request_delay
+        self.strava_max_retries = strava_max_retries
+        self._strava_session = None
+        self._strava_access_token = None
+        self._strava_token_expires_at = None
+
+        # wordt later gevuld
+        self.gdf = None
+        self.lines = []
+        self.fig = None
+        self.ax = None
+        self.line_layers = []
+        self.point_layers = []
+        self.step = 1
+        self.frames = 0
+        self._line_coords = []  # precomputed numpy arrays per lijn (snelheid)
+
+    # ==============================================================
+    # Tredict: activiteiten downloaden (.fit / .tcx)
+    # ==============================================================
+    def _get_tredict_session(self):
+        if self._tredict_session is None:
+            if not self.tredict_token:
+                raise RuntimeError(
+                    "Geen tredict_token opgegeven. Geef deze mee bij het "
+                    "aanmaken van CyclingMovementRenderer(tredict_token=...)."
+                )
+            session = requests.Session()
+            session.headers.update(
+                {
+                    "Authorization": f"Bearer {self.tredict_token}",
+                    "Accept": "application/json",
+                }
+            )
+            self._tredict_session = session
+        return self._tredict_session
+
+    def _tredict_get_with_retry(self, url, params=None):
+        """
+        GET request met retry-logica voor tijdelijke fouten (rate limits,
+        server errors, connectie-problemen).
+        """
+        session = self._get_tredict_session()
+
+        for attempt in range(1, self.tredict_max_retries + 1):
+            try:
+                response = session.get(url, params=params, timeout=120)
+
+                if response.status_code == 200:
+                    return response
+
+                if response.status_code == 429:
+                    wait = 2 ** attempt
+                    print(f"    Rate limit (429). Wachten {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+                if response.status_code in {500, 502, 503, 504}:
+                    wait = 2 ** attempt
+                    print(f"    Server error ({response.status_code}). Wachten {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+                if response.status_code in {401, 403}:
+                    raise RuntimeError(
+                        f"Tredict authentication error {response.status_code}: "
+                        f"{response.text}"
+                    )
+
+                response.raise_for_status()
+
+            except requests.RequestException as e:
+                if attempt >= self.tredict_max_retries:
+                    raise
+                wait = 2 ** attempt
+                print(f"    Connection error: {e}")
+                print(f"    Retry in {wait}s...")
+                time.sleep(wait)
+
+        raise RuntimeError(f"Request failed after {self.tredict_max_retries} attempts.")
+
+    @staticmethod
+    def _parse_tredict_date(value):
+        """Parse een Tredict UTC ISO timestamp, bv. 2026-08-31T12:34:56.000Z"""
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    @staticmethod
+    def _safe_filename(value):
+        """Verwijdert tekens die problematisch zijn op Windows."""
+        value = str(value)
+        value = re.sub(r'[<>:"/\\|?*]', "_", value)
+        value = value.rstrip(". ")
+        return value.strip()
+
+    @staticmethod
+    def _is_tredict_cycling(activity):
+        """Tredict documenteert sportType-waardes zoals cycling/running/swimming/misc."""
+        sport_type = (activity.get("sportType") or "").lower()
+        return sport_type == "cycling"
+
+    def fetch_tredict_activities(self, start_date):
+        """
+        Haalt activiteiten op van Tredict, van nu terug tot start_date.
+
+        Tredict's activityList is een one-way traversal: nieuw -> oud.
+        We gebruiken de 'next' link voor paginering en stoppen zodra we
+        een activiteit tegenkomen die ouder is dan start_date.
+
+        start_date: string in formaat "YYYY-MM-DD"
+        """
+        start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        if start_datetime > now:
+            raise ValueError("start_date kan niet in de toekomst liggen.")
+
+        activities = []
+        url = f"{self.tredict_base_url}/activityList"
+        params = {"pageSize": self.tredict_page_size}
+        page = 1
+
+        while True:
+            print()
+            print(f"Fetching activity page {page}...")
+
+            response = self._tredict_get_with_retry(url, params=params)
+            data = response.json()
+            batch = data.get("_embedded", {}).get("activityList", [])
+
+            if not batch:
+                print("No more activities.")
+                break
+
+            print(f"  Received {len(batch)} activities.")
+
+            reached_start_date = False
+            for activity in batch:
+                activity_date = activity.get("date")
+                if not activity_date:
+                    continue
+                try:
+                    activity_datetime = self._parse_tredict_date(activity_date)
+                except ValueError:
+                    print(f"  WARNING: invalid date: {activity_date}")
+                    continue
+
+                if activity_datetime < start_datetime:
+                    reached_start_date = True
+                    break
+
+                activities.append(activity)
+
+            if reached_start_date:
+                print()
+                print(f"Reached start_date ({start_date}).")
+                break
+
+            next_link = data.get("_links", {}).get("next")
+            if not next_link:
+                print("No next page.")
+                break
+
+            next_url = next_link.get("href")
+            if not next_url:
+                print("No next URL.")
+                break
+
+            url = next_url
+            params = None
+            page += 1
+            time.sleep(self.tredict_request_delay)
+
+        return activities
+
+    def _download_tredict_activity(self, activity, fit_dir):
+        """
+        Downloadt het originele activiteitsbestand (.fit of .tcx) van
+        Tredict naar fit_dir. Geeft True terug als er gedownload is,
+        False als het bestand al bestond.
+        """
+        activity_id = activity["id"]
+        title = activity.get("title") or activity.get("name") or "cycling"
+        date_value = activity.get("date") or "unknown-date"
+        timestamp = date_value.replace(":", "-").replace("T", "_").replace("Z", "")
+        safe_title = self._safe_filename(title)
+
+        output_file = fit_dir / f"{timestamp}_{safe_title}_{activity_id}.fit"
+        if output_file.exists():
+            print(f"    Already exists: {output_file.name}")
+            return False
+
+        url = f"{self.tredict_base_url}/activity/file/{activity_id}"
+        response = self._tredict_get_with_retry(url)
+
+        content_disposition = response.headers.get("Content-Disposition", "")
+        match = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
+
+        extension = ".fit"
+        if match:
+            original_extension = Path(match.group(1)).suffix.lower()
+            if original_extension in {".fit", ".tcx"}:
+                extension = original_extension
+
+        output_file = fit_dir / f"{timestamp}_{safe_title}_{activity_id}{extension}"
+        if output_file.exists():
+            print(f"    Already exists: {output_file.name}")
+            return False
+
+        output_file.write_bytes(response.content)
+        print(f"    -> {output_file}")
+        return True
+
+    def download_tredict_cycling_activities(self, start_date, fit_dir=None):
+        """
+        Haalt fietsactiviteiten op van Tredict (vanaf start_date tot nu)
+        en downloadt de originele .fit/.tcx bestanden naar fit_dir
+        (standaard self.fit_dir).
+
+        Geeft een dict terug met downloaded/skipped/failed tellers.
+        """
+        fit_dir = Path(fit_dir or self.fit_dir)
+        fit_dir.mkdir(parents=True, exist_ok=True)
+
+        print("=" * 70)
+        print("TREDICT CYCLING ACTIVITY DOWNLOADER")
+        print("=" * 70)
+        print(f"Start date : {start_date}")
+        print(f"Output     : {fit_dir.resolve()}")
+        print()
+
+        print("Fetching activities from Tredict...")
+        activities = self.fetch_tredict_activities(start_date)
+
+        print()
+        print(f"Activities in requested period: {len(activities)}")
+
+        cycling_activities = [a for a in activities if self._is_tredict_cycling(a)]
+        print(f"Cycling activities: {len(cycling_activities)}")
+
+        result = {"downloaded": 0, "skipped": 0, "failed": 0}
+
+        if not cycling_activities:
+            print()
+            print("No cycling activities found.")
+            return result
+
+        print()
+        for index, activity in enumerate(cycling_activities, start=1):
+            activity_id = activity.get("id", "unknown")
+            title = activity.get("title") or activity.get("name") or "cycling"
+            date_value = activity.get("date", "unknown")
+
+            print(f"[{index}/{len(cycling_activities)}] {date_value} - {title} ({activity_id})")
+
+            try:
+                downloaded = self._download_tredict_activity(activity, fit_dir)
+                if downloaded:
+                    result["downloaded"] += 1
+                else:
+                    result["skipped"] += 1
+            except Exception as e:
+                result["failed"] += 1
+                print(f"    ERROR: {e}")
+
+            # Tredict documenteert een maximum van 10 downloads per seconde.
+            time.sleep(self.tredict_request_delay)
+
+        print()
+        print("=" * 70)
+        print("DONE")
+        print("=" * 70)
+        print(f"Activities found : {len(activities)}")
+        print(f"Cycling         : {len(cycling_activities)}")
+        print(f"Downloaded       : {result['downloaded']}")
+        print(f"Skipped          : {result['skipped']}")
+        print(f"Failed           : {result['failed']}")
+        print(f"Output directory : {fit_dir.resolve()}")
+
+        return result
+
+    # ==============================================================
+    # FIT -> GPX conversie (alleen fietsactiviteiten)
+    # ==============================================================
+    def _get_fit_converter(self):
+        if self._fit_converter is None:
+            self._fit_converter = Converter()
+        return self._fit_converter
+
+    @staticmethod
+    def _get_fit_sport_type(fitfile):
+        """Leest het sporttype uit een FIT-file."""
+        for record in fitfile.get_messages("sport"):
+            values = {field.name: field.value for field in record}
+            sport = values.get("sport")
+            sub_sport = values.get("sub_sport")
+            if sport:
+                return str(sport).lower(), str(sub_sport).lower() if sub_sport else None
+        return None, None
+
+    @classmethod
+    def _is_cycling_fit(cls, sport, sub_sport):
+        """Controleert of een FIT-activiteit een fietsactiviteit is."""
+        if not sport:
+            return False
+        sport = sport.lower()
+        if sport in cls.CYCLING_FIT_SPORTS:
+            return True
+        if "cycl" in sport:
+            return True
+        if sub_sport and "cycl" in sub_sport:
+            return True
+        return False
+
+    @staticmethod
+    def _fit_has_trackpoints(fitfile):
+        """Controleert of een FIT-file GPS-recordpunten bevat."""
+        for record in fitfile.get_messages("record"):
+            lat = lon = None
+            for field in record:
+                if field.name == "position_lat":
+                    lat = field.value
+                elif field.name == "position_long":
+                    lon = field.value
+            if lat is not None and lon is not None:
+                return True
+        return False
+
+    def _fit_file_to_gpx(self, fit_path, gpx_path):
+        """
+        Zet één .fit bestand om naar .gpx, maar alleen als het een
+        fietsactiviteit is met bruikbare trackdata. Gebruikt fit2gpx
+        voor de daadwerkelijke conversie.
+        """
+        fitfile = FitFile(str(fit_path))
+
+        sport, sub_sport = self._get_fit_sport_type(fitfile)
+        if not self._is_cycling_fit(sport, sub_sport):
+            print(f"OVERGESLAGEN (geen fietsactiviteit): {fit_path.name}")
+            return False
+
+        if not self._fit_has_trackpoints(fitfile):
+            print(f"OVERGESLAGEN (geen trackdata): {fit_path.name}")
+            return False
+
+        converter = self._get_fit_converter()
+        converter.fit_to_gpx(f_in=fit_path, f_out=str(gpx_path))
+        print(f"OK: {fit_path.name} -> {gpx_path.name}")
+        return True
+
+    def convert_fit_folder_to_gpx(self, fit_dir=None, gpx_dir=None):
+        """
+        Zet alle .fit bestanden in fit_dir (standaard self.fit_dir) om
+        naar .gpx bestanden in gpx_dir (standaard self.data_source, als
+        dat een mappad is). Alleen fietsactiviteiten met trackdata
+        worden geconverteerd; de rest wordt overgeslagen.
+
+        Geeft een dict terug met converted/skipped/failed tellers.
+        """
+        fit_dir = Path(fit_dir or self.fit_dir)
+        gpx_dir = Path(gpx_dir or self.data_source)
+        gpx_dir.mkdir(parents=True, exist_ok=True)
+
+        fit_files = list(fit_dir.glob("*.fit"))
+        print(f"Gevonden: {len(fit_files)} FIT-bestanden in {fit_dir}")
+
+        result = {"converted": 0, "skipped": 0, "failed": 0}
+
+        for fit_file in fit_files:
+            gpx_file = gpx_dir / f"{fit_file.stem}.gpx"
+            try:
+                converted = self._fit_file_to_gpx(fit_file, gpx_file)
+                if converted:
+                    result["converted"] += 1
+                else:
+                    result["skipped"] += 1
+            except Exception as e:
+                result["failed"] += 1
+                print(f"FOUT in {fit_file.name}: {e}")
+
+        print(
+            f"FIT->GPX klaar: {result['converted']} geconverteerd, "
+            f"{result['skipped']} overgeslagen, {result['failed']} mislukt."
+        )
+        return result
+
+    def sync_from_tredict(self, start_date, fit_dir=None, gpx_dir=None):
+        """
+        Combineert download_tredict_cycling_activities() en
+        convert_fit_folder_to_gpx() in één stap: haalt nieuwe
+        fietsactiviteiten op van Tredict, zet ze om naar .gpx, en zet
+        self.data_source op de resulterende gpx-map zodat run() /
+        load_data() deze meteen kan gebruiken.
+        """
+        fit_dir = Path(fit_dir or self.fit_dir)
+        gpx_dir = Path(gpx_dir or self.data_source)
+
+        self.download_tredict_cycling_activities(start_date=start_date, fit_dir=fit_dir)
+        self.convert_fit_folder_to_gpx(fit_dir=fit_dir, gpx_dir=gpx_dir)
+
+        self.data_source = str(gpx_dir)
+        return self
+
+    # ==============================================================
+    # Strava: activiteiten lijsten en downloaden (volledig via de
+    # officiële API)
+    # ==============================================================
+    #
+    # Zowel het lijsten van activiteiten als het ophalen van de
+    # GPS-data gebeurt via de officiële, gedocumenteerde Strava API
+    # met OAuth (client_id/client_secret/refresh_token):
+    #   - GET /athlete/activities voor de lijst met activiteiten;
+    #   - GET /activities/{id}/streams voor de lat/lng/hoogte/tijd-
+    #     data van één activiteit, waar we zelf een .gpx bestand van
+    #     opbouwen (Strava biedt geen directe .gpx-download-endpoint
+    #     aan in de officiële API).
+    #
+    # Let op:
+    #   - Voor eigen private activiteiten heeft je Strava API-app de
+    #     OAuth-scope "activity:read_all" nodig (i.p.v. alleen
+    #     "activity:read"), anders krijg je alleen streams van
+    #     publieke activiteiten terug.
+    #   - Strava's officiële API is aan rate limits gebonden
+    #     (standaard 100 requests/15 min en 1000/dag per app). Bij
+    #     veel activiteiten kan het ophalen van streams (1 request
+    #     per activiteit) dus wat tijd kosten; de retry-logica hieronder
+    #     wacht automatisch bij een 429.
+    def _strava_get_with_retry(self, url, params=None):
+        """
+        GET request naar de Strava API met retry-logica voor rate
+        limits (429), tijdelijke server-fouten (5xx), verbindings-
+        problemen, en een eenmalige token-refresh bij een verlopen
+        access_token (401). Andere clientfouten (bv. 403 door een
+        ontbrekende OAuth-scope) worden niet blijvend geretried, en
+        de laatste response wordt in de foutmelding meegegeven zodat
+        de echte oorzaak zichtbaar is i.p.v. een generieke melding.
+        """
+        access_token = self._get_strava_access_token()
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        last_response = None
+        token_refreshed = False
+
+        for attempt in range(1, self.strava_max_retries + 1):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=60)
+            except requests.RequestException as e:
+                if attempt >= self.strava_max_retries:
+                    raise
+                wait = 2 ** attempt
+                print(f"    Connection error: {e}")
+                print(f"    Retry in {wait}s...")
+                time.sleep(wait)
+                continue
+
+            last_response = response
+
+            if response.status_code == 401 and not token_refreshed:
+                # Access_token blijkbaar verlopen/ongeldig: forceer één
+                # keer een nieuwe refresh en probeer opnieuw. Blijft
+                # het daarna nog 401, dan is het geen verlopen token
+                # maar iets structureels (bv. verkeerde client_id/
+                # client_secret/refresh_token) en stoppen we ermee.
+                print("    Access token verlopen/ongeldig (401). Token verversen...")
+                self._strava_access_token = None
+                self._strava_token_expires_at = None
+                access_token = self._get_strava_access_token()
+                headers = {"Authorization": f"Bearer {access_token}"}
+                token_refreshed = True
+                continue
+
+            if response.status_code == 429:
+                wait = 15 * attempt
+                print(f"    Rate limit (429). Wachten {wait}s...")
+                time.sleep(wait)
+                continue
+
+            if response.status_code in {500, 502, 503, 504}:
+                wait = 2 ** attempt
+                print(f"    Server error ({response.status_code}). Wachten {wait}s...")
+                time.sleep(wait)
+                continue
+
+            if response.status_code >= 400:
+                # Andere clientfout (401 na refresh, 403 door
+                # ontbrekende scope, 404, etc): retryen heeft geen zin,
+                # direct stoppen zodat de echte fout zichtbaar wordt.
+                break
+
+            return response
+
+        detail = ""
+        if last_response is not None:
+            detail = f" (laatste status: {last_response.status_code}, body: {last_response.text[:300]})"
+        raise RuntimeError(f"Strava request mislukt: {url}{detail}")
+
+    @staticmethod
+    def exchange_strava_authorization_code(client_id, client_secret, code):
+        """
+        Eenmalige helper om een OAuth authorization 'code' (verkregen
+        via de browser-autorisatiestap) om te wisselen voor een
+        refresh_token. Nodig als je een RuntimeError krijgt met
+        "activity:read_permission missing" - dat betekent dat je
+        huidige refresh_token zonder de juiste scope is aangemaakt.
+
+        Gebruikt stravalib (pip install stravalib) voor de daadwerkelijke
+        uitwisseling.
+
+        Stappen:
+          1. Bezoek in de browser (met je eigen client_id, en
+             scope=activity:read_all voor ook private activiteiten,
+             of activity:read voor alleen publieke):
+             https://www.strava.com/oauth/authorize?client_id=YOUR_CLIENT_ID&redirect_uri=http://localhost&response_type=code&approval_prompt=force&scope=activity:read_all
+          2. Log in / autoriseer de app. Je wordt doorgestuurd naar
+             een niet-bestaande localhost-pagina; kopieer de
+             "code=..." waarde uit de adresbalk (tot aan de
+             eerstvolgende "&", laat "&scope=..." erna weg).
+          3. Roep deze methode meteen aan met die verse code (codes
+             zijn eenmalig en maar enkele minuten geldig):
+             CyclingMovementRenderer.exchange_strava_authorization_code(
+                 client_id="...", client_secret="...", code="...",
+             )
+          4. Bewaar de geprinte refresh_token (bv. als
+             STRAVA_REFRESH_TOKEN environment variable) en gebruik
+             die voortaan.
+        """
+        try:
+            from stravalib import Client
+        except ImportError as e:
+            raise ImportError(
+                "stravalib is niet geïnstalleerd. Installeer het met "
+                "'pip install stravalib' om deze helper te gebruiken."
+            ) from e
+
+        client = Client()
+        try:
+            token_response = client.exchange_code_for_token(
+                client_id=client_id, client_secret=client_secret, code=code
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Code-uitwisseling mislukt: {e}\n"
+                "Meest voorkomende oorzaken: de code is al één keer "
+                "gebruikt, verlopen (codes zijn maar enkele minuten "
+                "geldig), fout gekopieerd (bv. mét een '&scope=...' "
+                "staartje erachter), of client_id/client_secret horen "
+                "niet bij dezelfde Strava API-app. Doorloop stap 1-2 "
+                "opnieuw voor een verse code."
+            ) from e
+
+        print("Nieuwe refresh_token:", token_response["refresh_token"])
+        print("Toegekende scopes staan in de 'scope' query-parameter van de redirect-URL uit stap 2.")
+        return token_response
+
+    def _get_strava_access_token(self):
+        """
+        Wisselt de refresh_token om voor een tijdelijk access_token via
+        stravalib (pip install stravalib). Het token wordt gecached tot
+        vlak voor het verloopt, zodat niet bij elke aanroep een nieuw
+        token wordt opgehaald.
+        """
+        if not (self.strava_client_id and self.strava_client_secret and self.strava_refresh_token):
+            raise RuntimeError(
+                "Geef strava_client_id, strava_client_secret en "
+                "strava_refresh_token mee bij het aanmaken van "
+                "CyclingMovementRenderer(...) om de Strava API te gebruiken."
+            )
+
+        now = time.time()
+        if self._strava_access_token and self._strava_token_expires_at and now < self._strava_token_expires_at - 60:
+            return self._strava_access_token
+
+        try:
+            from stravalib import Client
+        except ImportError as e:
+            raise ImportError(
+                "stravalib is niet geïnstalleerd. Installeer het met "
+                "'pip install stravalib' om de Strava-integratie te gebruiken."
+            ) from e
+
+        client = Client()
+        try:
+            token_response = client.refresh_access_token(
+                client_id=self.strava_client_id,
+                client_secret=self.strava_client_secret,
+                refresh_token=self.strava_refresh_token,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Ophalen van Strava access_token mislukt: {e}\n"
+                "Meest voorkomende oorzaken: strava_refresh_token is "
+                "onjuist/verouderd (bv. per ongeluk het token van "
+                "strava.com/settings/api, of een niet meer geldige "
+                "refresh_token - refresh_tokens kunnen wijzigen bij "
+                "gebruik), of strava_client_id/strava_client_secret "
+                "horen niet bij dezelfde Strava API-app."
+            ) from e
+
+        self._strava_access_token = token_response["access_token"]
+        self._strava_token_expires_at = token_response.get("expires_at", now + 3600)
+
+        # Strava kan bij het verversen soms een nieuwe refresh_token
+        # teruggeven die de oude vervangt; die pakken we dan meteen
+        # over zodat een volgende refresh niet op een verouderde
+        # (ongeldige) token stukloopt.
+        new_refresh_token = token_response.get("refresh_token")
+        if new_refresh_token and new_refresh_token != self.strava_refresh_token:
+            print(
+                "Let op: Strava gaf een nieuwe refresh_token terug. "
+                f"Update strava_refresh_token naar: {new_refresh_token}"
+            )
+            self.strava_refresh_token = new_refresh_token
+
+        return self._strava_access_token
+
+    def list_strava_activities(self, start_date, cycling_only=True):
+        """
+        Haalt via de officiële Strava API alle activiteiten op vanaf
+        start_date ("YYYY-MM-DD") tot nu, met paginering.
+
+        cycling_only=True filtert op fiets-gerelateerde sport_type
+        waardes (Ride, GravelRide, MountainBikeRide, VirtualRide, etc).
+
+        Geeft een lijst met dicts terug: {"id", "name", "start_date",
+        "sport_type"}.
+        """
+        start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        after_epoch = int(start_datetime.timestamp())
+
+        activities = []
+        page = 1
+
+        while True:
+            print(f"Fetching Strava activity page {page}...")
+
+            response = self._strava_get_with_retry(
+                f"{self.strava_base_url}/athlete/activities",
+                params={"after": after_epoch, "per_page": self.strava_page_size, "page": page},
+            )
+            batch = response.json()
+
+            if not batch:
+                print("No more activities.")
+                break
+
+            print(f"  Received {len(batch)} activities.")
+
+            for activity in batch:
+                sport_type = (activity.get("sport_type") or activity.get("type") or "").lower()
+
+                if cycling_only and "ride" not in sport_type and "cycl" not in sport_type:
+                    continue
+
+                activities.append(
+                    {
+                        "id": activity["id"],
+                        "name": activity.get("name", "activity"),
+                        "start_date": activity.get("start_date"),
+                        "sport_type": activity.get("sport_type") or activity.get("type"),
+                    }
+                )
+
+            if len(batch) < self.strava_page_size:
+                break
+
+            page += 1
+            time.sleep(self.strava_request_delay)
+
+        print(f"Totaal gevonden: {len(activities)} {'fiets' if cycling_only else ''}activiteiten sinds {start_date}.")
+        return activities
+
+    def _get_strava_activity_streams(self, activity_id):
+        """
+        Haalt de lat/lng-, hoogte- en tijd-streams van één activiteit
+        op via de officiële Strava API.
+        """
+        response = self._strava_get_with_retry(
+            f"{self.strava_base_url}/activities/{activity_id}/streams",
+            params={"keys": "latlng,altitude,time", "key_by_type": "true"},
+        )
+        return response.json()
+
+    @staticmethod
+    def _strava_streams_to_gpx(activity, streams, output_path):
+        """
+        Bouwt een .gpx bestand op basis van de lat/lng/altitude/time
+        streams van een Strava-activiteit (officiële API). Strava
+        biedt zelf geen directe .gpx-download aan in de API, dus we
+        zetten de streams hier zelf om met gpxpy.
+        """
+        latlng_stream = streams.get("latlng", {})
+        latlng = latlng_stream.get("data") if isinstance(latlng_stream, dict) else None
+
+        if not latlng:
+            raise ValueError(
+                "Geen GPS-data (latlng-stream) beschikbaar voor deze activiteit "
+                "(bv. een indoor/virtuele rit zonder GPS)."
+            )
+
+        altitude_stream = streams.get("altitude", {})
+        altitude = altitude_stream.get("data") if isinstance(altitude_stream, dict) else None
+
+        time_stream = streams.get("time", {})
+        time_offsets = time_stream.get("data") if isinstance(time_stream, dict) else None
+
+        start_date = activity.get("start_date")  # ISO8601 UTC, bv 2026-08-31T08:32:11Z
+        start_dt = None
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+
+        gpx = gpxpy.gpx.GPX()
+        track = gpxpy.gpx.GPXTrack(name=activity.get("name", "Strava activity"))
+        gpx.tracks.append(track)
+        segment = gpxpy.gpx.GPXTrackSegment()
+        track.segments.append(segment)
+
+        for i, point in enumerate(latlng):
+            lat, lon = point
+            ele = altitude[i] if altitude and i < len(altitude) else None
+
+            point_time = None
+            if start_dt is not None and time_offsets and i < len(time_offsets):
+                point_time = start_dt + timedelta(seconds=time_offsets[i])
+
+            segment.points.append(
+                gpxpy.gpx.GPXTrackPoint(lat, lon, elevation=ele, time=point_time)
+            )
+
+        output_path.write_text(gpx.to_xml(), encoding="utf-8")
+        return True
+
+    def download_strava_cycling_activities(self, start_date, gpx_dir=None):
+        """
+        Haalt fietsactiviteiten op van Strava (volledig via de
+        officiële API: activiteitenlijst + streams) en schrijft ze
+        weg als .gpx bestanden in gpx_dir (standaard self.data_source).
+
+        Geeft een dict terug met downloaded/skipped/failed tellers.
+        """
+        gpx_dir = Path(gpx_dir or self.data_source)
+        gpx_dir.mkdir(parents=True, exist_ok=True)
+
+        activities = self.list_strava_activities(start_date, cycling_only=True)
+
+        result = {"downloaded": 0, "skipped": 0, "failed": 0}
+
+        for index, activity in enumerate(activities, start=1):
+            activity_id = activity["id"]
+            output_file = gpx_dir / f"{activity_id}.gpx"
+
+            print(f"[{index}/{len(activities)}] {activity['start_date']} - {activity['name']} ({activity_id})")
+
+            if output_file.exists():
+                print(f"    Already exists: {output_file.name}")
+                result["skipped"] += 1
+                continue
+
+            try:
+                streams = self._get_strava_activity_streams(activity_id)
+                self._strava_streams_to_gpx(activity, streams, output_file)
+                print(f"    -> {output_file}")
+                result["downloaded"] += 1
+            except Exception as e:
+                result["failed"] += 1
+                print(f"    ERROR: {e}")
+
+            time.sleep(self.strava_request_delay)
+
+        print(
+            f"Strava download klaar: {result['downloaded']} gedownload, "
+            f"{result['skipped']} overgeslagen, {result['failed']} mislukt."
+        )
+        return result
+
+    def sync_from_strava(self, start_date, gpx_dir=None):
+        """
+        Haalt nieuwe fietsactiviteiten op van Strava (via de officiële
+        API) en zet self.data_source op de resulterende gpx-map,
+        zodat run() / load_data() deze meteen kan gebruiken.
+        """
+        gpx_dir = Path(gpx_dir or self.data_source)
+        self.download_strava_cycling_activities(start_date=start_date, gpx_dir=gpx_dir)
+        self.data_source = str(gpx_dir)
+        return self
+
+    # ------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------
+    def load_data(self):
+        """
+        Leest self.data_source in, ongeacht of dit een map met .gpx
+        bestanden is, een .gpkg bestand, of een ander vector-bestand
+        (bv. .geojson). Vult self.lines met LineStrings in EPSG:3857.
+        """
+        if os.path.isdir(self.data_source):
+            gdf = self._read_gpx_folder(self.data_source)
+        elif self.data_source.lower().endswith(".gpkg"):
+            gdf = self._read_geopackage(self.data_source)
+        else:
+            gdf = gpd.read_file(self.data_source)
+
+        gdf = gdf.to_crs(3857)
+        self.gdf = gdf
+
+        lines = []
+        for geom in gdf.geometry:
+            if geom is None:
+                continue
+            if geom.geom_type == "LineString":
+                lines.append(geom)
+            elif geom.geom_type == "MultiLineString":
+                lines.extend(list(geom.geoms))
+
+        self.lines = lines
+        # Coords één keer voorberekenen als numpy arrays i.p.v. elke
+        # frame opnieuw list(line.coords) op te bouwen (grote speedup
+        # bij lange tracks).
+        self._line_coords = [np.array(line.coords) for line in lines]
+        return self
+
+    @staticmethod
+    def _read_gpx_folder(folder_path, layer="tracks"):
+        """
+        Leest alle .gpx bestanden in een map in en combineert ze tot
+        één GeoDataFrame. Standaard wordt de 'tracks' layer gebruikt
+        (LineString/MultiLineString per track). Bestanden zonder
+        tracks worden overgeslagen.
+        """
+        gpx_files = sorted(glob.glob(os.path.join(folder_path, "*.gpx")))
+        if not gpx_files:
+            raise FileNotFoundError(f"Geen .gpx bestanden gevonden in {folder_path}")
+
+        gdfs = []
+        for gpx_file in gpx_files:
+            try:
+                gdf = gpd.read_file(gpx_file, layer=layer)
+            except Exception as e:
+                print(f"Waarschuwing: kon {gpx_file} niet lezen ({e}), overgeslagen.")
+                continue
+            if not gdf.empty:
+                gdf["source_file"] = os.path.basename(gpx_file)
+                gdfs.append(gdf)
+
+        if not gdfs:
+            raise ValueError(f"Geen bruikbare tracks gevonden in {folder_path}")
+
+        combined = pd.concat(gdfs, ignore_index=True)
+        return gpd.GeoDataFrame(combined, geometry="geometry", crs=gdfs[0].crs)
+
+    @staticmethod
+    def _read_geopackage(gpkg_path, layer=None):
+        """
+        Leest een .gpkg bestand in. Als er meerdere layers in zitten
+        en er geen layer is opgegeven, wordt de eerste layer gebruikt.
+        """
+        if layer is not None:
+            return gpd.read_file(gpkg_path, layer=layer)
+
+        layers = gpd.list_layers(gpkg_path)
+        if len(layers) > 1:
+            print(
+                f"Waarschuwing: {gpkg_path} bevat meerdere layers "
+                f"({list(layers['name'])}), eerste layer wordt gebruikt."
+            )
+        return gpd.read_file(gpkg_path)
+
+    # ------------------------------------------------------------
+    # Figure + basemap
+    # ------------------------------------------------------------
+    def _get_tile_source(self):
+        """
+        Geeft de basemap-bron terug voor contextily. Als er geen
+        api_key is opgegeven (leeg of None), wordt teruggevallen op de
+        gratis OsmAnd HD-tileserver. Anders wordt de Thunderforest
+        Atlas-stijl gebruikt met de opgegeven api_key.
+        """
+        if not self.api_key:
+            return "https://tile.osmand.net/hd/{z}/{x}/{y}.png"
+
+        return (
+            "https://api.thunderforest.com/"
+            "atlas/{z}/{x}/{y}@2x.png"
+            f"?apikey={self.api_key}"
+        )
+
+    def setup_figure(self):
+        self.fig = plt.figure(figsize=self.figsize, dpi=self.dpi)
+        # Volledig full-page axes, net als bij export_a0_map(). Dit
+        # voorkomt dat de as-box afhankelijk van de dpi anders wordt
+        # opgesteld (zoals fig.tight_layout() deed), wat bij hogere
+        # dpi de basemap kon uitrekken en tekst relatief te groot
+        # liet lijken.
+        self.ax = self.fig.add_axes([0, 0, 1, 1])
+        self.ax.set_xlim(self.xmin, self.xmax)
+        self.ax.set_ylim(self.ymin, self.ymax)
+
+        ctx.add_basemap(
+            self.ax,
+            source=self._get_tile_source(),
+            crs="EPSG:3857",
+            zoom=self.zoom,
+            interpolation="bilinear",
+            reset_extent=False,
+            attribution=False,
+        )
+        self.ax.set_axis_off()
+        return self
+
+    # ------------------------------------------------------------
+    # Track- en punt-layers
+    # ------------------------------------------------------------
+    def create_layers(self):
+        self.line_layers = []
+        self.point_layers = []
+        for _ in self.lines:
+            track_layer, = self.ax.plot(
+                [], [], color="red", linewidth=1, alpha=0.9
+            )
+            point_layer = self.ax.scatter(
+                [], [], color="blue", s=20, zorder=10
+            )
+            self.line_layers.append(track_layer)
+            self.point_layers.append(point_layer)
+        return self
+
+    # ------------------------------------------------------------
+    # "Last Updated" label
+    # ------------------------------------------------------------
+    def add_last_updated_label(self, today=None):
+        today = today or date.today().strftime("%Y-%m-%d")
+        self.ax.text(
+            0.02, 0.98,
+            f"Last Updated: {today}",
+            transform=self.ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=14,
+            zorder=20,
+            bbox=dict(
+                boxstyle="round,pad=0.4",
+                facecolor="lightgrey",
+                edgecolor="none",
+                alpha=0.6,
+            ),
+        )
+        return self
+
+    # ------------------------------------------------------------
+    # Aantal frames bepalen
+    # ------------------------------------------------------------
+    def compute_frame_count(self):
+        max_frames = self.fps * self.max_duration
+        max_vertices = max(len(line.coords) for line in self.lines)
+
+        self.step = max(1, int(max_vertices / max_frames))
+        self.frames = int(max_vertices / self.step)
+        return self
+
+    # ------------------------------------------------------------
+    # Eén frame tekenen
+    # ------------------------------------------------------------
+    def draw_frame(self, frame):
+        current_index = frame * self.step
+        for j, coords in enumerate(self._line_coords):
+            n = min(current_index, len(coords))
+            if n > 0:
+                xy = coords[:n]
+                self.line_layers[j].set_data(xy[:, 0], xy[:, 1])
+
+                if current_index < len(coords):
+                    # Route is nog bezig: stip op het huidige punt tonen.
+                    self.point_layers[j].set_offsets(xy[-1:])
+                else:
+                    # Route is klaar getekend: stip laten verdwijnen,
+                    # lijn blijft wel volledig zichtbaar staan.
+                    self.point_layers[j].set_offsets(np.empty((0, 2)))
+
+    # ------------------------------------------------------------
+    # Alle frames wegschrijven als JPG
+    # ------------------------------------------------------------
+    def render_frames(self):
+        """
+        Rendert alle frames en schrijft ze as JPG weg. Gebruikt
+        matplotlib-blitting: de statische achtergrond (basemap + label)
+        wordt één keer gerenderd en gecached; per frame wordt alleen
+        de gewijzigde lijnen/punten opnieuw getekend en in die
+        gecachte achtergrond geplakt. Dat is veel sneller dan elke
+        frame de volledige figuur (incl. basemap-tiles) opnieuw op te
+        bouwen via fig.savefig().
+        """
+        os.makedirs(self.frames_dir, exist_ok=True)
+
+        canvas = self.fig.canvas
+        canvas.draw()
+        # Achtergrond (basemap, "Last Updated"-label, etc.) cachen
+        background = canvas.copy_from_bbox(self.fig.bbox)
+
+        for frame in range(self.frames):
+            if frame % 25 == 0 or frame == self.frames - 1:
+                print(f"Rendering frame {frame + 1}/{self.frames}")
+
+            self.draw_frame(frame)
+
+            canvas.restore_region(background)
+            for artist in (*self.line_layers, *self.point_layers):
+                self.ax.draw_artist(artist)
+            canvas.blit(self.fig.bbox)
+
+            # Framebuffer direct als array pakken en met PIL wegschrijven
+            # (sneller dan fig.savefig, dat opnieuw door de hele
+            # matplotlib-backend gaat).
+            buf = np.asarray(canvas.buffer_rgba())
+            img = Image.fromarray(buf[:, :, :3])  # alpha kanaal droppen voor JPG
+            img.save(
+                os.path.join(self.frames_dir, f"frame_{frame:05d}.jpg"),
+                quality=90,
+            )
+
+        plt.close(self.fig)
+        return self
+
+    # ------------------------------------------------------------
+    # Video bouwen met ffmpeg
+    # ------------------------------------------------------------
+    def build_video(self):
+        """
+        Bouwt de video van de gerenderde JPG-frames met imageio +
+        imageio-ffmpeg (pip install imageio imageio-ffmpeg). Dit
+        gebruikt een door pip meegeleverde ffmpeg-binary, dus geen
+        handmatig ffmpeg-pad meer nodig.
+        """
+        frame_files = sorted(glob.glob(os.path.join(self.frames_dir, "frame_*.jpg")))
+        if not frame_files:
+            raise FileNotFoundError(
+                f"Geen frames gevonden in {self.frames_dir}. "
+                "Roep eerst render_frames() aan."
+            )
+
+        print(f"Video opbouwen uit {len(frame_files)} frames...")
+        writer_kwargs = dict(
+            fps=self.fps,
+            codec="libx264",
+            pixelformat="yuv420p",
+            output_params=["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"],
+            # We forceren zelf al even breedte/hoogte via bovenstaande
+            # -vf filter (voldoende voor yuv420p/h264). Zonder dit zou
+            # imageio-ffmpeg óók automatisch proberen te resizen naar
+            # een veelvoud van 16, wat botst met onze eigen -vf optie
+            # ("Multiple -filter" warning) en tot verwarrende/dubbele
+            # scaling kan leiden.
+            macro_block_size=1,
+        )
+        if self.ffmpeg_path:
+            writer_kwargs["ffmpeg_params"] = []  # placeholder, zie opmerking hieronder
+            os.environ["IMAGEIO_FFMPEG_EXE"] = self.ffmpeg_path
+
+        with imageio.get_writer(self.output_video, **writer_kwargs) as writer:
+            for frame_file in frame_files:
+                writer.append_data(imageio.imread(frame_file))
+
+        print(f"Done: {self.output_video}")
+        return self
+
+    # ------------------------------------------------------------
+    # A0 poster export (los van de video-render)
+    # ------------------------------------------------------------
+    def export_a0_map(
+        self,
+        output_pdf="a0_map.pdf",
+        zoom=14,
+        line_color="red",
+        line_width=1.5,
+        margin=0.05,
+    ):
+        """
+        Exporteert self.gdf (alle lijnen, volledig getekend) als een
+        A0-poster PDF over de basemap. Vereist dat load_data() al is
+        aangeroepen.
+        """
+        if self.gdf is None:
+            raise RuntimeError("Roep eerst load_data() aan voordat je export_a0_map() gebruikt.")
+
+        if self.gdf.empty:
+            raise ValueError("De GeoDataFrame is leeg.")
+
+        lines = self.gdf[self.gdf.geometry.notna()].copy()
+        lines = lines.to_crs(epsg=3857)
+
+        # ------------------------------------------------------------
+        # Extent met marge rondom de opgegeven bounding box
+        # ------------------------------------------------------------
+        width = self.xmax - self.xmin
+        height = self.ymax - self.ymin
+
+        xmin = self.xmin - width * margin
+        xmax = self.xmax + width * margin
+        ymin = self.ymin - height * margin
+        ymax = self.ymax + height * margin
+
+        # ------------------------------------------------------------
+        # A0 afmetingen in inches (841 x 1189 mm)
+        # ------------------------------------------------------------
+        a0_width = 1189 / 25.4
+        a0_height = 841 / 25.4
+
+        fig = plt.figure(figsize=(a0_width, a0_height), dpi=300)
+
+        # Volledig full-page axes
+        ax = fig.add_axes([0, 0, 1, 1])
+
+        # Extent instellen VOORDAT de basemap wordt toegevoegd
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+
+        ctx.add_basemap(
+            ax,
+            source=self._get_tile_source(),
+            crs="EPSG:3857",
+            zoom=zoom,
+            interpolation="bilinear",
+            reset_extent=False,
+            attribution=False,
+        )
+
+        lines.plot(
+            ax=ax,
+            color=line_color,
+            linewidth=line_width,
+            alpha=0.9,
+            zorder=10,
+        )
+
+        ax.set_axis_off()
+
+        fig.savefig(
+            output_pdf,
+            format="pdf",
+            dpi=300,
+            bbox_inches=None,
+            pad_inches=0,
+        )
+
+        plt.close(fig)
+        print(f"A0 poster opgeslagen als: {output_pdf}")
+        return self
+
+    # ------------------------------------------------------------
+    # Simpele interactieve folium-kaart met de routes
+    # ------------------------------------------------------------
+    def export_folium_map(
+        self,
+        output_html="routes_map.html",
+        line_color="red",
+        line_weight=3,
+        zoom_start=12,
+    ):
+        """
+        Maakt een eenvoudige interactieve HTML-kaart (folium) met alle
+        routes uit self.gdf erop. Vereist dat load_data() al is
+        aangeroepen. Gebruikt dezelfde tile-bron als de rest van de
+        klasse: Thunderforest als er een api_key is opgegeven, anders
+        de gratis OsmAnd HD-tileserver.
+        """
+        try:
+            import folium
+        except ImportError as e:
+            raise ImportError(
+                "folium is niet geïnstalleerd. Installeer het met "
+                "'pip install folium' om export_folium_map() te gebruiken."
+            ) from e
+
+        if self.gdf is None:
+            raise RuntimeError(
+                "Roep eerst load_data() aan voordat je export_folium_map() gebruikt."
+            )
+
+        if self.gdf.empty:
+            raise ValueError("De GeoDataFrame is leeg.")
+
+        # Folium werkt in lat/lon (EPSG:4326), self.gdf staat in EPSG:3857
+        gdf_4326 = self.gdf.to_crs(epsg=4326)
+
+        # [minx, miny, maxx, maxy]
+        minx, miny, maxx, maxy = gdf_4326.total_bounds
+        center_lat = (miny + maxy) / 2
+        center_lon = (minx + maxx) / 2
+
+        tiles = self._get_tile_source()
+        attr = "Thunderforest" if self.api_key else "OsmAnd"
+
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=zoom_start,
+            tiles=tiles,
+            attr=attr,
+        )
+
+        folium.GeoJson(
+            gdf_4326,
+            style_function=lambda feature: {
+                "color": line_color,
+                "weight": line_weight,
+                "opacity": 0.9,
+            },
+        ).add_to(m)
+
+        # Automatisch inzoomen op de volledige extent van de routes
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+        m.save(output_html)
+        print(f"Folium-kaart opgeslagen als: {output_html}")
+        return self
+
+    # ------------------------------------------------------------
+    # Alles in één keer uitvoeren
+    # ------------------------------------------------------------
+    def run(self):
+        (
+            self.load_data()
+            .setup_figure()
+            .create_layers()
+            .add_last_updated_label()
+            .compute_frame_count()
+            .render_frames()
+            .build_video()
+        )
+        return self
+
+#%%
+if __name__ == "__main__":
+    # data_source mag een .geojson, .gpkg, of een map met .gpx bestanden zijn:
+    renderer = CyclingMovementRenderer(
+        data_source="Activities_gpx",
+        # data_source="all_tracks.gpkg",
+        # data_source="gpx_tracks/",
+        ##ffmpeg_path=r"C:\Users\harke007\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.1-full_build-shared\bin\ffmpeg.exe",
+        api_key="6a53e8b25d114a5e9216df5bf9b5e9c8",
+        extent=(566922.7716, 6772346.9800, 702660.2619, 6873108.8243),
+        # Alleen nodig als je sync_from_tredict() / 
+        # download_tredict_cycling_activities() gebruikt. Zet je token
+        # liever in een environment variable dan hardcoded in het script:
+        tredict_token="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJyYndlblJ4aFV2TFVlVHBjNEhFZ3ZGIiwiaWF0IjoxNzg4MTk2ODczLCJleHAiOjMwNDk2MzY4NzMsInRyZWRpY3RVc2VySWQiOiJBbnJzMHROMWEiLCJwZXJzb25hbEFwaSI6dHJ1ZSwic2NvcGVzIjoiYWN0aXZpdHlSZWFkLGFjdGl2aXR5V3JpdGUsYm9keXZhbHVlc1JlYWQsYm9keXZhbHVlc1dyaXRlIn0.4LKy_yG8h8iDUHcsUnulxJCDKyVyd7NEPmGAn-iVyjk",#os.environ.get("TREDICT_TOKEN"),
+        fit_dir="Activities_fit",
+        # Alleen nodig als je sync_from_strava() /
+        # download_strava_cycling_activities() gebruikt. Aan te maken
+        # via https://www.strava.com/settings/api. Zet ze liever in
+        # environment variables dan hardcoded in het script:
+        strava_client_id="276202",#os.environ.get("STRAVA_CLIENT_ID"),
+        strava_client_secret="0307c0ceeb2f5950b1dcd6a694554ba60019dfde",#os.environ.get("STRAVA_CLIENT_SECRET"),
+        strava_refresh_token="e64fe7ab9b3bf0a09798b43e5f8a19587b8d3eaf"#os.environ.get("STRAVA_REFRESH_TOKEN"),
+    )
+
+    # Alleen de video renderen (met wat al in Activities_gpx staat):
+    renderer.run()
+
+    # Of eerst nieuwe fietsactiviteiten van Tredict downloaden (.fit),
+    # omzetten naar .gpx in de Activities_gpx map, en die daarna
+    # gebruiken voor de video:
+    # renderer.sync_from_tredict(start_date="2026-08-01")
+    # renderer.run()
+
+    # Of de twee stappen los van elkaar:
+    # renderer.download_tredict_cycling_activities(start_date="2026-08-01")
+    # renderer.convert_fit_folder_to_gpx()
+    # renderer.run()
+
+    # Of eerst interactief de bbox kiezen op basis van de geladen data:
+    # renderer.load_data().define_bbox_interactively(zoom=10)
+    # renderer.run()
+
+    # Of alleen de A0-poster, op basis van dezelfde geladen data:
+    # renderer.load_data().export_a0_map(
+    #     output_pdf="Routes.pdf",
+    #     zoom=13,
+    # )
+
+    # Of een simpele interactieve HTML-kaart met alle routes:
+    # renderer.load_data().export_folium_map(
+    #     output_html="Routes.html",
+    # )
+
+    # Of eerst nieuwe fietsactiviteiten van Strava downloaden als
+    # .gpx, volledig via de officiële API (activiteitenlijst +
+    # streams, zie de Strava-sectie in de klasse):
+    renderer.sync_from_strava(start_date="2026-08-31")
+    # renderer.run()
+
+    # Of alleen de activiteiten lijsten (zonder te downloaden):
+    # activities = renderer.list_strava_activities(start_date="2026-08-01")
+    # for a in activities:
+    #     print(a["id"], a["start_date"], a["name"])
