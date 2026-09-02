@@ -6,7 +6,7 @@
 2. een **interactieve HTML-kaart** (folium/Leaflet), en
 3. een **grote poster-PDF** (A0) met alle routes tegelijk uitgetekend.
 
-De klasse is bewust *bron-onafhankelijk*: je kan zelf een map met `.gpx` bestanden vullen, of de klasse laten downloaden/converteren via Tredict, de officiële Strava API, of een Strava bulk-export.
+De klasse is bewust *bron-onafhankelijk*: je kan zelf een map met `.gpx` bestanden vullen, of de klasse laten downloaden/converteren via Tredict, de officiële Strava API, een Strava bulk-export of een Garmin bulk-export.
 
 ---
 
