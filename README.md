@@ -34,7 +34,6 @@ De klasse is bewust *bron-onafhankelijk*: je kan zelf een map met `.gpx` bestand
 - [Methode-referentie](#methode-referentie)
 - [Strava OAuth: refresh_token verkrijgen](#strava-oauth-refresh_token-verkrijgen)
 - [Bestandsstructuur / defaults](#bestandsstructuur--defaults)
-- [Troubleshooting](#troubleshooting)
 - [Dependencies](#dependencies)
 
 ---
@@ -68,7 +67,8 @@ Dit zijn de variabelen die (afhankelijk van welke databron je gebruikt) nodig ku
 | `STRAVA_CLIENT_ID` | `sync_from_strava()` / `download_strava_activities()` | [strava.com/settings/api](https://www.strava.com/settings/api) |
 | `STRAVA_CLIENT_SECRET` | idem | idem |
 | `STRAVA_REFRESH_TOKEN` | idem | Zie [Strava OAuth](#strava-oauth-refresh_token-verkrijgen) — **niet** het standaardtoken van de instellingenpagina |
-| `THUNDERFOREST_TOKEN` | Achtergrond kaar | Je Thunderforest API Key, als je niet de standaard OSM basemap gebruikt |
+| `THUNDERFOREST_TOKEN` | Achtergrond kaart | Je Thunderforest API Key, als je niet de standaard OSM basemap gebruikt |
+
 Gebruik je alleen de methodes `sync_from_strava_export()` (de bulk-export) of `convert_fit_folder_to_gpx()`? Dan zijn deze variabelen niet nodig.
 
 ### Windows: `set_env_vars.bat`
@@ -150,7 +150,7 @@ Alle `sync_from_*()`-methoden schrijven hun resultaat standaard naar deze map (`
 `api_key` is een Thunderforest API-key. Laat 'm leeg (`""` of `None`, ook de default) en de klasse valt automatisch terug op de gratis **OsmAnd HD-tileserver** — zowel voor de video, de A0-poster, als de folium-kaart.
 
 ``` python
-renderer.api_key = os.environ.get("STRAVA_CLIENT_ID")
+renderer.api_key = os.environ.get("THUNDERFOREST_TOKEN")
 ```
 
 
@@ -455,31 +455,6 @@ project/
 ```
 
 ---
-
-## Troubleshooting
-
-**`ValueError: max() arg is an empty sequence` in `compute_frame_count()`**
-`self.lines` is leeg nadat `load_data()` de gpx-map inlas. Meestal betekent dit dat de `.gpx` bestanden geen `LineString`/`MultiLineString`-geometrieën in de `tracks`-layer bevatten (bv. lege tracks, of tracks met maar één punt). Controleer met:
-```python
-renderer.load_data()
-print(renderer.gdf.geom_type.value_counts())
-print(len(renderer.gdf))
-```
-
-**`IMAGEIO FFMPEG_WRITER WARNING: input image is not divisible by macro_block_size`**
-Al opgelost: de writer gebruikt `macro_block_size=1` in combinatie met een eigen `-vf scale=trunc(iw/2)*2:trunc(ih/2)*2`-filter, dus dit zou niet meer moeten optreden.
-
-**Tekst/basemap ziet er raar uit bij hogere `dpi`**
-Al opgelost: `setup_figure()` gebruikt full-bleed axes (`fig.add_axes([0,0,1,1])`) i.p.v. `tight_layout()`, en de Agg-backend wordt geforceerd zodat Windows-schermschaling geen rol meer speelt.
-
-**Folium-kaart toont alleen de labels, geen kaart**
-Al opgelost: het extent/zoom-updatescript wacht nu op het `window.load`-event en is met `try/catch` afgeschermd, zodat het nooit de rest van de pagina blokkeert.
-
-**`Strava request mislukt ... 401 ... activity:read_permission missing`**
-Zie [Strava OAuth](#strava-oauth-refresh_token-verkrijgen) hierboven.
-
----
-
 ## Dependencies
 
 | Package | Waarvoor |
