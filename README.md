@@ -134,6 +134,7 @@ renderer.sync_from_strava_export(
     csv_path="StravaExport/activities.csv",
     activities_dir="StravaExport/activities",
 )
+```
 
 ### 5 Strava — officiële API
 
@@ -149,7 +150,7 @@ Haalt activiteiten op via `GET /athlete/activities`, en bouwt voor elke activite
 > Vereist `stravalib` voor de OAuth-token-uitwisseling.
 
 
-```
+
 
 Verwerkt een Strava bulk-export (aan te vragen via **Instellingen → Mijn account → Download of verwijder je account → Alle je activiteiten downloaden**). Leest `activities.csv` (Nederlands of Engels, robuust tegen meerdere linefeeds binnen aangehaalde velden), filtert op `activity_filter`, en zet per activiteit het bronbestand om:
 
