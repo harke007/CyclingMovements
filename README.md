@@ -13,6 +13,7 @@ De klasse is bewust *bron-onafhankelijk*: je kan zelf een map met `.gpx` bestand
 ## Inhoudsopgave
 
 - [Installatie](#installatie)
+- [Environment variables (secrets)](#environment-variables-secrets)
 - [Snel starten](#snel-starten)
 - [Concepten](#concepten)
   - [`activity_filter`: fietsen vs. hardlopen](#activity_filter-fietsen-vs-hardlopen)
@@ -48,6 +49,53 @@ pip install stravalib     # alleen nodig voor de Strava API-integratie
 ```
 
 > `build_video()` gebruikt de ffmpeg-binary die `imageio-ffmpeg` meelevert — een losse ffmpeg-installatie is normaal niet nodig.
+
+---
+
+## Environment variables (secrets)
+
+Tokens en API-secrets horen **niet** hardcoded in je script (zeker niet als je het deelt of commit naar git). De klasse leest ze daarom via `os.environ.get(...)` uit, bv.:
+
+```python
+renderer.tredict_token = os.environ.get("TREDICT_TOKEN")
+```
+
+Dit zijn de variabelen die (afhankelijk van welke databron je gebruikt) nodig kunnen zijn:
+
+| Variabele | Nodig voor | Waar te verkrijgen |
+|---|---|---|
+| `TREDICT_TOKEN` | `sync_from_tredict()` / `download_tredict_activities()` | Je Tredict personal API-token |
+| `STRAVA_CLIENT_ID` | `sync_from_strava()` / `download_strava_activities()` | [strava.com/settings/api](https://www.strava.com/settings/api) |
+| `STRAVA_CLIENT_SECRET` | idem | idem |
+| `STRAVA_REFRESH_TOKEN` | idem | Zie [Strava OAuth](#strava-oauth-refresh_token-verkrijgen) — **niet** het standaardtoken van de instellingenpagina |
+
+Nodig je alleen `sync_from_strava_export()` (de bulk-export) of `convert_fit_folder_to_gpx()`? Dan zijn deze variabelen niet nodig.
+
+### Windows: `set_env_vars.bat`
+
+Voor het gemak staat er een klein batch-scriptje bij (`set_env_vars.bat`) dat deze vier variabelen in één keer zet:
+
+```bat
+setx TREDICT_TOKEN "..."
+setx STRAVA_CLIENT_ID "..."
+setx STRAVA_CLIENT_SECRET "..."
+setx STRAVA_REFRESH_TOKEN "..."
+```
+
+Gebruik:
+1. Open `set_env_vars.bat` in een teksteditor en vul je echte waardes in.
+2. Dubbelklik het bestand (of run het vanuit een terminal) — `setx` zet de variabelen **permanent** op user-niveau.
+3. **Sluit en heropen** je terminal / Spyder / Python-sessie: een al openstaand venster leest de nieuwe waardes niet automatisch in.
+4. Bewaar het ingevulde bestand *niet* in je git-repo (het bevat dan je echte secrets).
+
+Op macOS/Linux zet je ze i.p.v. dit batch-scriptje in je shell-profiel (`~/.zshrc`, `~/.bashrc`, …):
+
+```bash
+export TREDICT_TOKEN="..."
+export STRAVA_CLIENT_ID="..."
+export STRAVA_CLIENT_SECRET="..."
+export STRAVA_REFRESH_TOKEN="..."
+```
 
 ---
 
