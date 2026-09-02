@@ -1664,6 +1664,7 @@ class CyclingMovementRenderer:
         self,
         output_pdf="a0_map.pdf",
         zoom=14,
+        dpi=300,
         line_color="red",
         line_width=1.5,
         margin=0.05,
@@ -1699,7 +1700,7 @@ class CyclingMovementRenderer:
         a0_width = 1189 / 25.4
         a0_height = 841 / 25.4
 
-        fig = plt.figure(figsize=(a0_width, a0_height), dpi=300)
+        fig = plt.figure(figsize=(a0_width, a0_height), dpi=dpi)
 
         # Volledig full-page axes
         ax = fig.add_axes([0, 0, 1, 1])
@@ -1731,7 +1732,7 @@ class CyclingMovementRenderer:
         fig.savefig(
             output_pdf,
             format="pdf",
-            dpi=300,
+            dpi=dpi,
             bbox_inches=None,
             pad_inches=0,
         )
@@ -1938,7 +1939,7 @@ os.chdir("youworkingdirectory")
 # Wageningen) - in stap 4 kun je 'm interactief verfijnen.
 renderer = CyclingMovementRenderer(
     extent=(566922.7716, 6772346.9800, 702660.2619, 6873108.8243),
-    activity_filter="cycling",  # of "running"
+    activity_filter="running",  # of "running"
 )
 
 # ==============================================================
