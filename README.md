@@ -384,7 +384,7 @@ Alle parameters zijn **keyword-only** (op `data_source` na is `extent` de enige 
 | `render_frames()` | Rendert en schrijft alle JPG-frames weg |
 | `build_video(output_video)` | Zet de JPG-frames om naar `output_video` via ffmpeg — `output_video` is verplicht |
 | `run(output_video)` | Ketent `load_data → … → build_video(output_video)` — `output_video` is verplicht |
-| `export_a0_map(output_pdf, zoom, line_color, line_width, margin)` | A0-poster PDF, alle routes volledig getekend |
+| `export_a0_map(output_pdf, zoom, dpi, line_color, line_width, margin)` | A0-poster PDF, alle routes volledig getekend |
 | `export_folium_map(output_html, line_color, line_weight, zoom_start, today, show_extent_info)` | Interactieve HTML-kaart |
 
 ### Tredict
