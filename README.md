@@ -158,7 +158,9 @@ renderer.api_key = os.environ.get("THUNDERFOREST_TOKEN")
 
 ## Databronnen vullen
 
-Er zijn vijf manieren om de gpx-map te vullen. Kies er één.
+Er zijn vijf manieren om de gpx-map te vullen. Kies er één per run.
+
+> **Aanbevolen volgorde bij een eerste keer opzetten:** begin met een historische bulk-lading — optie 2 (Garmin `.fit`-export) of optie 5 (Strava bulk-export) — en gebruik daarna pas Tredict (optie 3) om **nieuwe** activiteiten sinds die eerste run bij te vullen. Zie de toelichting bij optie 3 hieronder.
 
 ### 1. Bestaande gpx-map
 
@@ -172,6 +174,17 @@ renderer.convert_fit_folder_to_gpx(fit_dir="Activities_fit")
 
 Converteert alle `.fit` bestanden in `fit_dir` naar `.gpx` in `renderer.data_source`, en slaat daarbij automatisch niet-`activity_filter`-activiteiten en bestanden zonder trackdata over.
 
+Deze optie is bedoeld voor een **Garmin Connect bulk-export** van je historische data (handig als startpunt, vóórdat je Tredict gebruikt voor de aanvullingen — zie optie 3). Zo kom je aan die `.fit` bestanden:
+
+1. Vraag je Garmin-data-export aan via [Garmin Connect → Account instellingen → Uw gegevens exporteren](https://www.garmin.com/nl-NL/account/datamanagement/exportdata/) ("Alle data exporteren"). Je krijgt een e-mail met een downloadlink zodra de export klaar is (dit kan enige tijd duren).
+2. De download bestaat uit één of meerdere `.zip`-bestanden. De activiteitenbestanden zelf staan in de submap:
+   ```
+   DI_CONNECT\DI-Connect-Uploaded-Files
+   ```
+3. Garmin's export is vaak zelf al opgedeeld in meerdere delen/zip-bestanden (bv. `export_1.zip`, `export_2.zip`, …). **Pak elk deel apart uit.**
+4. Kopieer de inhoud van de `DI-Connect-Uploaded-Files`-map van **elk uitgepakt deel** samen naar één map, bv. `Activities_fit` — dus alle `.fit` bestanden uit alle delen bij elkaar in dezelfde map.
+5. Roep daarna `convert_fit_folder_to_gpx(fit_dir="Activities_fit")` aan zoals hierboven.
+
 ### 3. Tredict
 
 ```python
@@ -180,6 +193,8 @@ renderer.sync_from_tredict(start_date="2026-08-01")
 ```
 
 Haalt activiteiten op van Tredict vanaf `start_date`, downloadt de originele `.fit`/`.tcx` bestanden, en converteert ze naar `.gpx`. Losse stappen zijn ook beschikbaar: `download_tredict_activities()` en `convert_fit_folder_to_gpx()`.
+
+> **Let op — Tredict is bedoeld om bij te vullen, niet voor de eerste (historische) lading.** Gebruik Tredict pas ná een eerste run met optie 2 (Garmin `.fit`-export) of optie 5 (Strava bulk-export), en zet `start_date` dan op de datum van je laatste sync. Zo download je alleen de nieuwe activiteiten sindsdien, in plaats van je volledige geschiedenis opnieuw via Tredict te moeten ophalen.
 
 ### 4. Strava — officiële API
 
