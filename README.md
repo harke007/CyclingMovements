@@ -80,13 +80,13 @@ setx TREDICT_TOKEN "..."
 setx STRAVA_CLIENT_ID "..."
 setx STRAVA_CLIENT_SECRET "..."
 setx STRAVA_REFRESH_TOKEN "..."
+setx THUNDERFOREST_TOKEN "..."
 ```
 
 Gebruik:
 1. Open `set_env_vars.bat` in een teksteditor en vul je echte waardes in.
 2. Dubbelklik het bestand (of run het vanuit een terminal) — `setx` zet de variabelen **permanent** op user-niveau.
 3. **Sluit en heropen** je terminal / Spyder / Python-sessie: een al openstaand venster leest de nieuwe waardes niet automatisch in.
-4. Bewaar het ingevulde bestand *niet* in je git-repo (het bevat dan je echte secrets).
 
 Op macOS/Linux zet je ze i.p.v. dit batch-scriptje in je shell-profiel (`~/.zshrc`, `~/.bashrc`, …):
 
@@ -95,6 +95,7 @@ export TREDICT_TOKEN="..."
 export STRAVA_CLIENT_ID="..."
 export STRAVA_CLIENT_SECRET="..."
 export STRAVA_REFRESH_TOKEN="..."
+export THUNDERFOREST_TOKEN "..."
 ```
 
 ---
@@ -112,10 +113,10 @@ renderer = CyclingMovementRenderer(
     data_source="Activities_gpx",    # optioneel, zie hieronder
 )
 
-renderer.run(output_video="cycling_movement2.mp4")   # load_data() -> setup_figure() -> ... -> build_video()
+renderer.run(output_video="cycling_movement.mp4")   # load_data() -> setup_figure() -> ... -> build_video()
 ```
 
-Dat rendert `cycling_movement2.mp4` in de working directory.
+Dat rendert `cycling_movement.mp4` in de working directory.
 
 ---
 
@@ -129,7 +130,7 @@ Eén instelling (`"cycling"` of `"running"`) bepaalt **overal** in de klasse wel
 |---|---|
 | Tredict-download | `sportType` van de Tredict-API wordt 1-op-1 vergeleken met `activity_filter` |
 | FIT-bestanden | Het interne FIT-sportveld wordt gecontroleerd tegen `CYCLING_FIT_SPORTS` / `RUNNING_FIT_SPORTS`, met een substring-fallback (`"cycl"` / `"run"`) |
-| Strava API | `sport_type` wordt vergeleken met `STRAVA_CYCLING_TYPES` (Ride, GravelRide, MountainBikeRide, VirtualRide, EBikeRide, Handcycle, …) of `STRAVA_RUNNING_TYPES` (Run, TrailRun, VirtualRun) |
+| Strava API | `sport_type` wordt vergeleken met `STRAVA_CYCLING_TYPES` (Ride, GravelRide, MountainBikeRide, ...) of `STRAVA_RUNNING_TYPES` (Run, TrailRun,) |
 | Strava bulk-export CSV | `Activiteitstype`/`Activity Type` wordt gematcht op trefwoorden in **beide talen** (NL: "Fietsrit", "Hardlopen"; EN: "Ride", "Run"; incl. varianten als "Gravelrit", "Trailrun", "Loopband") |
 | Standaard gpx-map | Als je geen `data_source` opgeeft, wordt automatisch `Activities_gpx_cycling` of `Activities_gpx_running` gebruikt |
 
@@ -147,6 +148,11 @@ Alle `sync_from_*()`-methoden schrijven hun resultaat standaard naar deze map (`
 ### Achtergrondkaart (`api_key`)
 
 `api_key` is een Thunderforest API-key. Laat 'm leeg (`""` of `None`, ook de default) en de klasse valt automatisch terug op de gratis **OsmAnd HD-tileserver** — zowel voor de video, de A0-poster, als de folium-kaart.
+
+``` python
+renderer.api_key = os.environ.get("STRAVA_CLIENT_ID")
+```
+
 
 ---
 
