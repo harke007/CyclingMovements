@@ -22,8 +22,8 @@ De klasse is bewust *bron-onafhankelijk*: je kan zelf een map met `.gpx` bestand
   - [1. Bestaande gpx-map](#1-bestaande-gpx-map)
   - [2. Map met `.fit` bestanden](#2-map-met-fit-bestanden)
   - [3. Tredict](#3-tredict)
-  - [4. Strava — officiële API](#4-strava--officiële-api)
-  - [5. Strava — bulk-export](#5-strava--bulk-export)
+  - [4. Strava — bulk-export](#4-strava--bulk-export)
+  - [5. Strava — officiële API](#5-strava--officiële-api)
 - [Output genereren](#output-genereren)
   - [Video](#video)
   - [Interactieve folium-kaart](#interactieve-folium-kaart)
@@ -127,7 +127,15 @@ renderer.sync_from_tredict(start_date="2026-08-01")
 
 Haalt activiteiten op van Tredict vanaf `start_date`, downloadt de originele `.fit`/`.tcx` bestanden, en converteert ze naar `.gpx`. Losse stappen zijn ook beschikbaar: `download_tredict_activities()` en `convert_fit_folder_to_gpx()`.
 
-### 4. Strava — officiële API
+### 4. Strava — bulk-export
+
+```python
+renderer.sync_from_strava_export(
+    csv_path="StravaExport/activities.csv",
+    activities_dir="StravaExport/activities",
+)
+
+### 5 Strava — officiële API
 
 ```python
 renderer.strava_client_id = "..."
@@ -140,13 +148,7 @@ Haalt activiteiten op via `GET /athlete/activities`, en bouwt voor elke activite
 
 > Vereist `stravalib` voor de OAuth-token-uitwisseling.
 
-### 5. Strava — bulk-export
 
-```python
-renderer.sync_from_strava_export(
-    csv_path="StravaExport/activities.csv",
-    activities_dir="StravaExport/activities",
-)
 ```
 
 Verwerkt een Strava bulk-export (aan te vragen via **Instellingen → Mijn account → Download of verwijder je account → Alle je activiteiten downloaden**). Leest `activities.csv` (Nederlands of Engels, robuust tegen meerdere linefeeds binnen aangehaalde velden), filtert op `activity_filter`, en zet per activiteit het bronbestand om:
