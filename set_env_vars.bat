@@ -21,6 +21,8 @@ setx STRAVA_CLIENT_ID "vul-hier-je-strava-client-id-in"
 setx STRAVA_CLIENT_SECRET "vul-hier-je-strava-client-secret-in"
 setx STRAVA_REFRESH_TOKEN "vul-hier-je-strava-refresh-token-in"
 
+setx THUNDERFOREST_TOKEN "vul-hier-je-thunderforest-apikey-in"
+
 echo.
 echo Environment variables gezet. Open een NIEUW terminal-/Python-
 echo venster om ze te kunnen gebruiken.
