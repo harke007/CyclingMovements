@@ -64,7 +64,7 @@ renderer = CyclingMovementRenderer(
     data_source="Activities_gpx",    # optioneel, zie hieronder
 )
 
-renderer.run()   # load_data() -> setup_figure() -> ... -> build_video()
+renderer.run(output_video="cycling_movement2.mp4")   # load_data() -> setup_figure() -> ... -> build_video()
 ```
 
 Dat rendert `cycling_movement2.mp4` in de working directory.
@@ -174,15 +174,17 @@ renderer.load_data()
     .add_last_updated_label()
     .compute_frame_count()
     .render_frames()
-    .build_video()
+    .build_video(output_video="cycling_movement2.mp4")
 )
 ```
 
-Of alles in één keer via `renderer.run()` (roept zelf ook `load_data()` aan).
+Of alles in één keer via `renderer.run(output_video="cycling_movement2.mp4")` (roept zelf ook `load_data()` aan).
 
-**Hoe het werkt:** elke track wordt geleidelijk getekend (rode lijn) met een blauwe stip op het actuele punt; de stip verdwijnt zodra die track klaar is. Frames worden als JPG weggeschreven (via matplotlib-blitting, snel) en met ffmpeg samengevoegd tot `output_video`.
+**Hoe het werkt:** elke track wordt geleidelijk getekend (rode lijn) met een blauwe stip op het actuele punt; de stip verdwijnt zodra die track klaar is. Frames worden als JPG weggeschreven (via matplotlib-blitting, snel) en met ffmpeg samengevoegd tot het opgegeven `output_video`-bestand.
 
-Relevante constructor-parameters: `output_video`, `frames_dir`, `fps`, `max_duration`, `dpi`, `figsize`, `zoom`, `ffmpeg_path`.
+`output_video` is een **verplichte parameter van `build_video()`/`run()`** (geen constructor-default) — net als `output_pdf` bij `export_a0_map()` en `output_html` bij `export_folium_map()`.
+
+Relevante constructor-parameters: `frames_dir`, `fps`, `max_duration`, `dpi`, `figsize`, `zoom`, `ffmpeg_path`.
 
 > **dpi-tip:** de klasse forceert de Agg-backend zodat de canvas-pixelgrootte altijd exact `figsize × dpi` is, onafhankelijk van Windows-schermschaling. Verhoog `dpi` gerust voor een scherpere video.
 
@@ -196,11 +198,26 @@ renderer.export_folium_map(output_html="Routes.html")
 Genereert een standalone HTML-bestand met:
 - alle routes als gekleurde lijnen op dezelfde achtergrondkaart als de video,
 - een **"Last Updated"**-label linksboven,
-- een **live extent/zoom-label** rechtsboven (EPSG:3857-meters) dat automatisch meebeweegt met pannen/zoomen in de browser (via Leaflet's `moveend`/`zoomend` events en `L.CRS.EPSG3857.project()`).
+- een **live extent/zoom-label** rechtsboven (EPSG:3857-meters, komma-gescheiden) dat automatisch meebeweegt met pannen/zoomen in de browser (via Leaflet's `moveend`/`zoomend` events en `L.CRS.EPSG3857.project()`).
 
 Parameters: `output_html`, `line_color`, `line_weight`, `zoom_start`, `today` (override voor het label), `show_extent_info`.
 
 > Vereist `folium` (`pip install folium`).
+
+#### Extent interactief kiezen via het live label
+
+Het extent-label toont het formaat `Extent (EPSG:3857): xmin, ymin, xmax, ymax` — bewust komma-gescheiden, zodat je de vier getallen direct uit de browser kan kopiëren en als Python-tuple kan plakken:
+
+1. Genereer een verkennende kaart: `renderer.export_folium_map(output_html="Routes_explore.html")`.
+2. Open dat bestand in je browser, pan/zoom naar het gebied dat je wil gebruiken.
+3. Kopieer de waardes achter "Extent (EPSG:3857):" uit het label rechtsboven.
+4. Plak ze in je script:
+   ```python
+   renderer.xmin, renderer.ymin, renderer.xmax, renderer.ymax = (600680.4, 6790015.9, 666416.2, 6814303.7)
+   ```
+5. Render daarna de definitieve video/poster/kaart — die gebruiken automatisch deze bijgewerkte extent.
+
+Dit is ook precies hoe stap 4-5 van het `if __name__ == "__main__":`-blok werken, zie [Volledige workflow-voorbeeld](#volledige-workflow-voorbeeld).
 
 ### A0-poster (PDF)
 
@@ -222,7 +239,7 @@ Dit is ook precies de structuur van het `if __name__ == "__main__":`-blok ondera
 ```python
 # 1) Minimale initialisatie
 renderer = CyclingMovementRenderer(
-    extent=(566922.7716, 6772346.9800, 702660.2619, 6873108.8243),
+    extent=(566922.7716, 6772346.9800, 702660.2619, 6873108.8243),  # startpunt
     activity_filter="cycling",
 )
 
@@ -234,10 +251,17 @@ renderer.sync_from_tredict(start_date="2026-08-01")
 # 3) Data inladen (nodig voor elke output)
 renderer.load_data()
 
-# 4) Kies welke output(s) je wil
+# 4) Extent interactief verfijnen: verkennende kaart bekijken, live
+#    label rechtsboven aflezen, en (optioneel) de extent bijwerken
+renderer.export_folium_map(output_html="Routes_explore.html")
+renderer.xmin, renderer.ymin, renderer.xmax, renderer.ymax = (
+    600680.4, 6790015.9, 666416.2, 6814303.7  # <- gekopieerd uit het label
+)
+
+# 5) Kies welke output(s) je wil - gebruiken nu de bijgewerkte extent
 renderer.setup_figure().create_layers().add_last_updated_label() \
-        .compute_frame_count().render_frames().build_video()
-renderer.export_folium_map(output_html="Routes.html")
+        .compute_frame_count().render_frames().build_video(output_video="cycling_movement2.mp4")
+renderer.export_folium_map(output_html="Routes.html")   # definitieve kaart, andere naam dan de verkenner
 renderer.export_a0_map(output_pdf="Routes.pdf")
 ```
 
@@ -253,7 +277,6 @@ Alle parameters zijn **keyword-only** (op `data_source` na is `extent` de enige 
 | `data_source` | `None` → `Activities_gpx_{activity_filter}` | Map met `.gpx` bestanden; wordt aangemaakt als hij niet bestaat |
 | `api_key` | `""` | Thunderforest API-key; leeg = gratis OsmAnd-tileserver |
 | `activity_filter` | `"cycling"` | `"cycling"` of `"running"` |
-| `output_video` | `"cycling_movement2.mp4"` | Bestandsnaam video-output |
 | `frames_dir` | `"frames"` | Map voor tijdelijke JPG-frames |
 | `fps` | `25` | Frames per seconde |
 | `max_duration` | `30` | Maximale videoduur (seconden) |
@@ -290,8 +313,8 @@ Alle parameters zijn **keyword-only** (op `data_source` na is `extent` de enige 
 | `compute_frame_count()` | Bepaalt `self.step`/`self.frames` op basis van `fps` × `max_duration` |
 | `draw_frame(frame)` | Tekent één frame (intern, gebruikt door `render_frames()`) |
 | `render_frames()` | Rendert en schrijft alle JPG-frames weg |
-| `build_video()` | Zet de JPG-frames om naar `output_video` via ffmpeg |
-| `run()` | Ketent `load_data → … → build_video` |
+| `build_video(output_video)` | Zet de JPG-frames om naar `output_video` via ffmpeg — `output_video` is verplicht |
+| `run(output_video)` | Ketent `load_data → … → build_video(output_video)` — `output_video` is verplicht |
 | `export_a0_map(output_pdf, zoom, line_color, line_width, margin)` | A0-poster PDF, alle routes volledig getekend |
 | `export_folium_map(output_html, line_color, line_weight, zoom_start, today, show_extent_info)` | Interactieve HTML-kaart |
 
@@ -371,8 +394,9 @@ project/
 ├── Activities_gpx_running/      # standaard gpx-map (activity_filter="running")
 ├── Activities_fit/              # standaard fit_dir (Tredict-downloads)
 ├── frames/                      # tijdelijke video-frames
-├── cycling_movement2.mp4        # standaard video-output
+├── cycling_movement2.mp4        # video-output (naam verplicht op te geven, zie build_video())
 ├── a0_map.pdf                   # standaard A0-poster
+├── Routes_explore.html          # optioneel: verkennende folium-kaart om de extent af te lezen
 └── routes_map.html              # standaard folium-kaart
 ```
 
