@@ -1,7 +1,12 @@
 import os
 import re
+import csv
+import gzip
 import glob
 import time
+import shutil
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 
@@ -21,7 +26,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.widgets import RectangleSelector
 import contextily as ctx
 import imageio.v2 as imageio
 
@@ -33,21 +37,36 @@ import gpxpy.gpx
 
 class CyclingMovementRenderer:
     """
-    Rendert een animatie van fietsroutes (LineStrings) bovenop een basemap,
+    Rendert een animatie van routes (LineStrings) bovenop een basemap,
     door elk frame als JPG weg te schrijven en die daarna met ffmpeg
     samen te voegen tot een video.
 
+    Standaard is dit gericht op fietsactiviteiten, maar via
+    activity_filter="running" (bij het aanmaken van de renderer)
+    wordt de hele klasse omgezet naar hardloopactiviteiten:
+    Tredict-download, FIT->GPX-conversie, de officiële Strava API en
+    de Strava bulk-export-CSV volgen allemaal deze ene instelling -
+    inclusief welke gpx-map standaard wordt gebruikt
+    ("Activities_gpx_cycling" / "Activities_gpx_running"), die
+    automatisch wordt aangemaakt als hij nog niet bestaat.
+
+    data_source verwacht een map met .gpx bestanden (geen los
+    geojson/geopackage-bestand meer); vul deze map met de sync_*
+    methoden hieronder, of handmatig.
+
     Optioneel kan deze klasse ook zelf de bron-data verzamelen:
-      1) download_tredict_cycling_activities() haalt .fit/.tcx bestanden
+      1) download_tredict_activities() haalt .fit/.tcx bestanden
          op van Tredict (zie tredict_call.py).
       2) convert_fit_folder_to_gpx() zet .fit bestanden om naar .gpx
-         (zie FittoGPXwithCheck.py), en filtert daarbij alleen
-         fietsactiviteiten.
+         (zie FittoGPXwithCheck.py), en filtert daarbij op
+         activity_filter.
       3) sync_from_tredict() doet beide stappen achter elkaar en zet
          self.data_source meteen op de resulterende gpx-map.
-      4) sync_from_strava() haalt fietsactiviteiten rechtstreeks op
-         via de Strava API (OAuth) en bouwt daar zelf .gpx bestanden
-         van, via de activity-streams endpoint (lat/lon/hoogte/tijd).
+      4) sync_from_strava() haalt activiteiten rechtstreeks op via de
+         Strava API (OAuth) en bouwt daar zelf .gpx bestanden van, via
+         de activity-streams endpoint (lat/lon/hoogte/tijd).
+      5) sync_from_strava_export() verwerkt een Strava bulk-export
+         (activities.csv + originele bestanden).
     """
 
     # Fiets-gerelateerde sporttypes zoals ze in FIT-bestanden voorkomen
@@ -59,21 +78,35 @@ class CyclingMovementRenderer:
         "ride",
     }
 
-    # Fiets-gerelateerde activity-types/sport-types zoals Strava ze teruggeeft
+    # Hardloop-gerelateerde sporttypes zoals ze in FIT-bestanden voorkomen
+    RUNNING_FIT_SPORTS = {
+        "running",
+        "run",
+        "trail_running",
+        "track_running",
+        "treadmill_running",
+        "indoor_running",
+    }
+
+    # Fiets-/hardloop-gerelateerde sport_type-waardes zoals de
+    # officiële Strava API ze teruggeeft (GET /athlete/activities).
     STRAVA_CYCLING_TYPES = {
-        "Ride",
-        "VirtualRide",
-        "EBikeRide",
-        "Handcycle",
-        "Velomobile",
+        "ride",
+        "mountainbikeride",
+        "gravelride",
+    }
+    STRAVA_RUNNING_TYPES = {
+        "run",
+        "trailrun",
     }
 
     def __init__(
         self,
-        data_source,
-        api_key,
+        *,
+        data_source=None,
+        api_key="",
         extent,
-        output_video="cycling_movement2.mp4",
+        activity_filter="cycling",
         frames_dir="frames",
         fps=25,
         max_duration=30,
@@ -98,10 +131,20 @@ class CyclingMovementRenderer:
         strava_max_retries=4,
     ):
         """
-        data_source kan zijn:
-          - een pad naar een geojson-bestand
-          - een pad naar een geopackage (.gpkg) bestand
-          - een pad naar een map met .gpx bestanden
+        data_source: pad naar een map met .gpx bestanden. Optioneel -
+        laat leeg (None) om automatisch een map te gebruiken die bij
+        activity_filter hoort ("Activities_gpx_cycling" of
+        "Activities_gpx_running"). Die map wordt, als hij nog niet
+        bestaat, meteen aangemaakt (handig bij een eerste run: dan is
+        er nog geen gpx-data en vul je de map daarna met
+        sync_from_tredict() / sync_from_strava() /
+        sync_from_strava_export()).
+
+        activity_filter: "cycling" (standaard) of "running". Bepaalt
+        overal in de klasse welke activiteiten worden geselecteerd:
+        Tredict-download, FIT->GPX-conversie, de officiële Strava API,
+        de Strava bulk-export-CSV, én (als data_source niet expliciet
+        is opgegeven) welke gpx-map wordt gebruikt.
 
         api_key: Thunderforest API key. Laat deze leeg ("" of None)
         om automatisch terug te vallen op de gratis OpenStreetMap
@@ -115,7 +158,7 @@ class CyclingMovementRenderer:
         andere/specifieke ffmpeg-installatie wil forceren.
 
         tredict_token is optioneel en alleen nodig als je
-        download_tredict_cycling_activities() / sync_from_tredict()
+        download_tredict_activities() / sync_from_tredict()
         gebruikt. Geef hem liever mee via een environment variable
         (bv. os.environ["TREDICT_TOKEN"]) dan hardcoded in je script.
 
@@ -124,7 +167,7 @@ class CyclingMovementRenderer:
 
         strava_client_id / strava_client_secret / strava_refresh_token
         zijn optioneel en alleen nodig als je
-        download_strava_cycling_activities() / sync_from_strava()
+        download_strava_activities() / sync_from_strava()
         gebruikt. Deze horen bij een Strava API-applicatie (aan te
         maken via https://www.strava.com/settings/api); de
         refresh_token haal je één keer op via
@@ -133,11 +176,26 @@ class CyclingMovementRenderer:
         je script. Vereist het pakket 'stravalib' (pip install
         stravalib) voor de OAuth-token-uitwisseling.
         """
+        if activity_filter not in ("cycling", "running"):
+            raise ValueError(
+                f"activity_filter moet 'cycling' of 'running' zijn, kreeg: {activity_filter!r}"
+            )
+        self.activity_filter = activity_filter
+
+        # Geen data_source opgegeven? Gebruik een map die bij de
+        # activity_filter hoort, zodat cycling- en running-data nooit
+        # per ongeluk door elkaar in dezelfde map belanden.
+        if data_source is None:
+            data_source = f"Activities_gpx_{activity_filter}"
+
+        # Zorg dat de gpx-map bestaat, ook bij een eerste run waarin
+        # er nog geen data is gedownload/geconverteerd.
+        Path(data_source).mkdir(parents=True, exist_ok=True)
+
         self.data_source = data_source
         self.ffmpeg_path = ffmpeg_path
         self.api_key = api_key
         self.xmin, self.ymin, self.xmax, self.ymax = extent
-        self.output_video = output_video
         self.frames_dir = frames_dir
         self.fps = fps
         self.max_duration = max_duration
@@ -255,11 +313,14 @@ class CyclingMovementRenderer:
         value = value.rstrip(". ")
         return value.strip()
 
-    @staticmethod
-    def _is_tredict_cycling(activity):
-        """Tredict documenteert sportType-waardes zoals cycling/running/swimming/misc."""
+    def _matches_activity_filter_tredict(self, activity):
+        """
+        Tredict documenteert sportType-waardes zoals
+        cycling/running/swimming/misc - deze komen 1-op-1 overeen met
+        self.activity_filter ("cycling"/"running").
+        """
         sport_type = (activity.get("sportType") or "").lower()
-        return sport_type == "cycling"
+        return sport_type == self.activity_filter
 
     def fetch_tredict_activities(self, start_date):
         """
@@ -373,10 +434,11 @@ class CyclingMovementRenderer:
         print(f"    -> {output_file}")
         return True
 
-    def download_tredict_cycling_activities(self, start_date, fit_dir=None):
+    def download_tredict_activities(self, start_date, fit_dir=None):
         """
-        Haalt fietsactiviteiten op van Tredict (vanaf start_date tot nu)
-        en downloadt de originele .fit/.tcx bestanden naar fit_dir
+        Haalt activiteiten op van Tredict (vanaf start_date tot nu) die
+        overeenkomen met self.activity_filter ("cycling"/"running"), en
+        downloadt de originele .fit/.tcx bestanden naar fit_dir
         (standaard self.fit_dir).
 
         Geeft een dict terug met downloaded/skipped/failed tellers.
@@ -385,7 +447,7 @@ class CyclingMovementRenderer:
         fit_dir.mkdir(parents=True, exist_ok=True)
 
         print("=" * 70)
-        print("TREDICT CYCLING ACTIVITY DOWNLOADER")
+        print(f"TREDICT {self.activity_filter.upper()} ACTIVITY DOWNLOADER")
         print("=" * 70)
         print(f"Start date : {start_date}")
         print(f"Output     : {fit_dir.resolve()}")
@@ -397,23 +459,23 @@ class CyclingMovementRenderer:
         print()
         print(f"Activities in requested period: {len(activities)}")
 
-        cycling_activities = [a for a in activities if self._is_tredict_cycling(a)]
-        print(f"Cycling activities: {len(cycling_activities)}")
+        filtered_activities = [a for a in activities if self._matches_activity_filter_tredict(a)]
+        print(f"{self.activity_filter.capitalize()} activities: {len(filtered_activities)}")
 
         result = {"downloaded": 0, "skipped": 0, "failed": 0}
 
-        if not cycling_activities:
+        if not filtered_activities:
             print()
-            print("No cycling activities found.")
+            print(f"No {self.activity_filter} activities found.")
             return result
 
         print()
-        for index, activity in enumerate(cycling_activities, start=1):
+        for index, activity in enumerate(filtered_activities, start=1):
             activity_id = activity.get("id", "unknown")
-            title = activity.get("title") or activity.get("name") or "cycling"
+            title = activity.get("title") or activity.get("name") or self.activity_filter
             date_value = activity.get("date", "unknown")
 
-            print(f"[{index}/{len(cycling_activities)}] {date_value} - {title} ({activity_id})")
+            print(f"[{index}/{len(filtered_activities)}] {date_value} - {title} ({activity_id})")
 
             try:
                 downloaded = self._download_tredict_activity(activity, fit_dir)
@@ -433,7 +495,7 @@ class CyclingMovementRenderer:
         print("DONE")
         print("=" * 70)
         print(f"Activities found : {len(activities)}")
-        print(f"Cycling         : {len(cycling_activities)}")
+        print(f"{self.activity_filter.capitalize():<16} : {len(filtered_activities)}")
         print(f"Downloaded       : {result['downloaded']}")
         print(f"Skipped          : {result['skipped']}")
         print(f"Failed           : {result['failed']}")
@@ -442,7 +504,7 @@ class CyclingMovementRenderer:
         return result
 
     # ==============================================================
-    # FIT -> GPX conversie (alleen fietsactiviteiten)
+    # FIT -> GPX conversie
     # ==============================================================
     def _get_fit_converter(self):
         if self._fit_converter is None:
@@ -460,17 +522,23 @@ class CyclingMovementRenderer:
                 return str(sport).lower(), str(sub_sport).lower() if sub_sport else None
         return None, None
 
-    @classmethod
-    def _is_cycling_fit(cls, sport, sub_sport):
-        """Controleert of een FIT-activiteit een fietsactiviteit is."""
+    def _matches_activity_filter_fit(self, sport, sub_sport):
+        """
+        Controleert of een FIT-activiteit overeenkomt met
+        self.activity_filter ("cycling"/"running").
+        """
         if not sport:
             return False
+
         sport = sport.lower()
-        if sport in cls.CYCLING_FIT_SPORTS:
+        explicit_sports = self.CYCLING_FIT_SPORTS if self.activity_filter == "cycling" else self.RUNNING_FIT_SPORTS
+        substring = "cycl" if self.activity_filter == "cycling" else "run"
+
+        if sport in explicit_sports:
             return True
-        if "cycl" in sport:
+        if substring in sport:
             return True
-        if sub_sport and "cycl" in sub_sport:
+        if sub_sport and substring in sub_sport:
             return True
         return False
 
@@ -488,18 +556,28 @@ class CyclingMovementRenderer:
                 return True
         return False
 
-    def _fit_file_to_gpx(self, fit_path, gpx_path):
+    def fit_to_gpx(self, fit_path, gpx_path, check_sport=True):
         """
-        Zet één .fit bestand om naar .gpx, maar alleen als het een
-        fietsactiviteit is met bruikbare trackdata. Gebruikt fit2gpx
-        voor de daadwerkelijke conversie.
+        Zet één .fit bestand om naar .gpx. Gebruikt fit2gpx voor de
+        daadwerkelijke conversie. Losse, herbruikbare methode zodat
+        andere workflows (Tredict-download, Strava bulk-export-import)
+         'm allebei kunnen aanroepen.
+
+        check_sport=True (standaard): sport uit de FIT-file zelf wordt
+        gecontroleerd tegen self.activity_filter ("cycling"/"running"),
+        en activiteiten van het verkeerde type of zonder trackdata
+        worden overgeslagen (return False). Zet dit op False als de
+        sport-filtering al elders is gebeurd (bv. op basis van de
+        Strava export-CSV) om dubbele/conflicterende filtering te
+        voorkomen.
         """
         fitfile = FitFile(str(fit_path))
 
-        sport, sub_sport = self._get_fit_sport_type(fitfile)
-        if not self._is_cycling_fit(sport, sub_sport):
-            print(f"OVERGESLAGEN (geen fietsactiviteit): {fit_path.name}")
-            return False
+        if check_sport:
+            sport, sub_sport = self._get_fit_sport_type(fitfile)
+            if not self._matches_activity_filter_fit(sport, sub_sport):
+                print(f"OVERGESLAGEN (geen {self.activity_filter}-activiteit): {fit_path.name}")
+                return False
 
         if not self._fit_has_trackpoints(fitfile):
             print(f"OVERGESLAGEN (geen trackdata): {fit_path.name}")
@@ -531,7 +609,7 @@ class CyclingMovementRenderer:
         for fit_file in fit_files:
             gpx_file = gpx_dir / f"{fit_file.stem}.gpx"
             try:
-                converted = self._fit_file_to_gpx(fit_file, gpx_file)
+                converted = self.fit_to_gpx(fit_file, gpx_file)
                 if converted:
                     result["converted"] += 1
                 else:
@@ -548,7 +626,7 @@ class CyclingMovementRenderer:
 
     def sync_from_tredict(self, start_date, fit_dir=None, gpx_dir=None):
         """
-        Combineert download_tredict_cycling_activities() en
+        Combineert download_tredict_activities() en
         convert_fit_folder_to_gpx() in één stap: haalt nieuwe
         fietsactiviteiten op van Tredict, zet ze om naar .gpx, en zet
         self.data_source op de resulterende gpx-map zodat run() /
@@ -557,9 +635,371 @@ class CyclingMovementRenderer:
         fit_dir = Path(fit_dir or self.fit_dir)
         gpx_dir = Path(gpx_dir or self.data_source)
 
-        self.download_tredict_cycling_activities(start_date=start_date, fit_dir=fit_dir)
+        self.download_tredict_activities(start_date=start_date, fit_dir=fit_dir)
         self.convert_fit_folder_to_gpx(fit_dir=fit_dir, gpx_dir=gpx_dir)
 
+        self.data_source = str(gpx_dir)
+        return self
+
+    # ==============================================================
+    # Strava bulk export: activities.csv verwerken
+    # ==============================================================
+    #
+    # Werkt op basis van de "bulk export" die je via Strava's
+    # accountinstellingen kan aanvragen (niet de live API). Die export
+    # bevat een activities.csv met alle activiteiten, plus een map
+    # met de originele bestanden per activiteit (.fit/.gpx/.tcx,
+    # eventueel .gz-gecomprimeerd).
+    #
+    # De CSV wordt gelezen met Python's csv-module, die zich houdt aan
+    # RFC4180-quoting: een veld dat tussen aanhalingstekens staat mag
+    # zelf linefeeds bevatten (bv. de beschrijving van een activiteit)
+    # zonder dat dit als een nieuwe rij wordt gezien. Dat lost het
+    # "rij begint soms niet met een activity ID"-probleem structureel
+    # op, in plaats van dat we zelf regels aan elkaar moeten plakken.
+
+    # Nederlandse en Engelse varianten van de relevante kolomnamen,
+    # afhankelijk van de taalinstelling van het Strava-account tijdens
+    # de export.
+    _STRAVA_CSV_ID_COLUMNS = ("Activity ID", "Activiteits-ID")
+    _STRAVA_CSV_TYPE_COLUMNS = ("Activity Type", "Activiteitstype")
+    _STRAVA_CSV_FILENAME_COLUMNS = ("Filename", "Bestandsnaam")
+
+    # Trefwoorden (kleine letters) die duiden op een fiets-gerelateerde
+    # activiteit, in beide talen. Substring-match, dus dekt ook
+    # "Gravelrit"/"Gravel Ride", "Mountainbiken"/"Mountain Bike Ride",
+    # "Virtuele fietsrit"/"Virtual Ride", "E-fietsrit"/"E-Bike Ride" etc.
+    CYCLING_CSV_KEYWORDS = {
+        "ride", "cycling", "bike", "biking",
+        "fiets", "wielren", "mountainbik", "mtb",
+        "gravel", "ebike", "e-bike", "e-fiets",
+        "handcycle", "handbike",
+        "velomobile", "velomobiel",
+    }
+
+    # Trefwoorden (kleine letters) die duiden op een hardloop-
+    # gerelateerde activiteit, in beide talen. Dekt o.a.
+    # "Hardlopen"/"Run", "Trailrun"/"Trail hardlopen",
+    # "Baanhardlopen"/"Track Run", "Loopband"/"Treadmill Run".
+    RUNNING_CSV_KEYWORDS = {
+        "run", "running",
+        "hardloop", "hardlop", "hardgelopen",
+        "trail run", "trailrun", "traillopen", "trailhardlopen",
+        "track run", "baanhardlop",
+        "treadmill", "loopband",
+    }
+
+    @staticmethod
+    def _get_csv_field(row, candidates):
+        """Geeft de waarde van de eerste aanwezige kolomnaam uit candidates."""
+        for name in candidates:
+            if name in row and row[name] not in (None, ""):
+                return row[name]
+        return None
+
+    def _matches_activity_filter_csv_type(self, activity_type):
+        """
+        Controleert of een activiteitstype uit de export-CSV
+        overeenkomt met self.activity_filter ("cycling"/"running").
+        """
+        if not activity_type:
+            return False
+        activity_type = activity_type.lower()
+        keywords = self.CYCLING_CSV_KEYWORDS if self.activity_filter == "cycling" else self.RUNNING_CSV_KEYWORDS
+        return any(keyword in activity_type for keyword in keywords)
+
+    def list_strava_export_activities(self, csv_path):
+        """
+        Leest een Strava bulk-export activities.csv (Engels of
+        Nederlands) en geeft een lijst met dicts terug voor alle
+        activiteiten die overeenkomen met self.activity_filter
+        ("cycling"/"running"): {"id", "activity_type", "filename"}.
+
+        Gebruikt csv.DictReader (RFC4180-quoting) zodat meerdere
+        linefeeds binnen een aangehaald veld (bv. de beschrijving)
+        niet per ongeluk als nieuwe rijen worden gelezen.
+        """
+        csv_path = Path(csv_path)
+
+        # newline="" is vereist door de csv-module voor correcte
+        # afhandeling van aangehaalde linefeeds/CRLF's.
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+
+            if reader.fieldnames is None:
+                raise ValueError(f"Kon geen header vinden in {csv_path}.")
+
+            id_column = next((c for c in self._STRAVA_CSV_ID_COLUMNS if c in reader.fieldnames), None)
+            type_column = next((c for c in self._STRAVA_CSV_TYPE_COLUMNS if c in reader.fieldnames), None)
+            filename_column = next((c for c in self._STRAVA_CSV_FILENAME_COLUMNS if c in reader.fieldnames), None)
+
+            if not id_column or not type_column:
+                raise ValueError(
+                    f"Verwachte kolommen niet gevonden in {csv_path}. "
+                    f"Gevonden kolommen: {reader.fieldnames}"
+                )
+
+            activities = []
+            skipped_no_id = 0
+
+            for row in reader:
+                activity_id = self._get_csv_field(row, (id_column,))
+                if not activity_id:
+                    # Zou met een correcte csv-reader niet meer moeten
+                    # voorkomen (linefeeds binnen quotes worden al
+                    # correct afgehandeld), maar als vangnet: rijen
+                    # zonder ID overslaan i.p.v. laten crashen.
+                    skipped_no_id += 1
+                    continue
+
+                activity_type = self._get_csv_field(row, (type_column,))
+                if not self._matches_activity_filter_csv_type(activity_type):
+                    continue
+
+                filename = self._get_csv_field(row, (filename_column,)) if filename_column else None
+
+                activities.append(
+                    {
+                        "id": str(activity_id).strip(),
+                        "activity_type": activity_type,
+                        "filename": filename.strip() if filename else None,
+                    }
+                )
+
+        if skipped_no_id:
+            print(f"Waarschuwing: {skipped_no_id} rij(en) zonder activity ID overgeslagen.")
+
+        print(f"Gevonden in {csv_path.name}: {len(activities)} {self.activity_filter}-activiteiten.")
+        return activities
+
+    @staticmethod
+    def _maybe_decompress(src_path, work_dir):
+        """
+        Als src_path een .gz bestand is, pakt het uit naar work_dir
+        (dezelfde bestandsnaam zonder .gz) en geeft dat pad terug.
+        Anders wordt src_path ongewijzigd teruggegeven.
+        """
+        src_path = Path(src_path)
+        if src_path.suffix.lower() != ".gz":
+            return src_path
+
+        work_dir = Path(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = work_dir / src_path.stem  # strip alleen de .gz
+
+        with gzip.open(src_path, "rb") as f_in, open(dest_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+        return dest_path
+
+    @staticmethod
+    def _strip_xml_ns(tag):
+        """Haalt een eventueel XML-namespace-voorvoegsel ({...}) van een tag af."""
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    def tcx_to_gpx(self, tcx_path, gpx_path):
+        """
+        Zet één .tcx bestand (Garmin Training Center XML) om naar
+        .gpx. Leest Trackpoints (tijd, lat/lon, hoogte) uit alle
+        Laps/Tracks in het bestand en zet ze om in een GPX-track met
+        één segment per Lap. Namespace-agnostisch (verschillende TCX-
+        exports gebruiken soms een andere xmlns), dus we matchen op
+        de lokale tag-naam i.p.v. de volledige namespace.
+        """
+        tcx_path = Path(tcx_path)
+        gpx_path = Path(gpx_path)
+
+        tree = ET.parse(tcx_path)
+        root = tree.getroot()
+
+        gpx = gpxpy.gpx.GPX()
+        track = gpxpy.gpx.GPXTrack(name=tcx_path.stem)
+        gpx.tracks.append(track)
+
+        found_any_point = False
+
+        for activity_el in root.iter():
+            if self._strip_xml_ns(activity_el.tag) != "Activity":
+                continue
+
+            for lap_el in activity_el:
+                if self._strip_xml_ns(lap_el.tag) != "Lap":
+                    continue
+
+                for track_el in lap_el:
+                    if self._strip_xml_ns(track_el.tag) != "Track":
+                        continue
+
+                    segment = gpxpy.gpx.GPXTrackSegment()
+
+                    for trackpoint_el in track_el:
+                        if self._strip_xml_ns(trackpoint_el.tag) != "Trackpoint":
+                            continue
+
+                        lat = lon = ele = None
+                        point_time = None
+
+                        for field_el in trackpoint_el:
+                            tag = self._strip_xml_ns(field_el.tag)
+
+                            if tag == "Time" and field_el.text:
+                                try:
+                                    point_time = datetime.fromisoformat(
+                                        field_el.text.replace("Z", "+00:00")
+                                    )
+                                except ValueError:
+                                    point_time = None
+
+                            elif tag == "Position":
+                                for pos_el in field_el:
+                                    pos_tag = self._strip_xml_ns(pos_el.tag)
+                                    if pos_tag == "LatitudeDegrees" and pos_el.text:
+                                        lat = float(pos_el.text)
+                                    elif pos_tag == "LongitudeDegrees" and pos_el.text:
+                                        lon = float(pos_el.text)
+
+                            elif tag == "AltitudeMeters" and field_el.text:
+                                try:
+                                    ele = float(field_el.text)
+                                except ValueError:
+                                    ele = None
+
+                        if lat is not None and lon is not None:
+                            segment.points.append(
+                                gpxpy.gpx.GPXTrackPoint(lat, lon, elevation=ele, time=point_time)
+                            )
+                            found_any_point = True
+
+                    if segment.points:
+                        track.segments.append(segment)
+
+        if not found_any_point:
+            raise ValueError(f"Geen GPS-trackpoints gevonden in {tcx_path.name}.")
+
+        gpx_path.write_text(gpx.to_xml(), encoding="utf-8")
+        return True
+
+    def import_strava_bulk_export(
+        self,
+        csv_path,
+        activities_dir="StravaExport/activities",
+        gpx_dir=None,
+        work_dir=None,
+    ):
+        """
+        Verwerkt een volledige Strava bulk-export:
+          1. Leest csv_path (activities.csv, Engels of Nederlands) en
+             filtert de activiteiten volgens self.activity_filter
+             ("cycling"/"running").
+          2. Zoekt per activiteit het bijhorende bronbestand
+             (.fit/.gpx/.tcx, eventueel .gz-gecomprimeerd) in
+             activities_dir.
+          3. Pakt het zo nodig uit en converteert het naar .gpx in
+             gpx_dir (standaard self.data_source):
+               - .fit  -> fit_to_gpx() (check_sport=False, want de
+                          sport is al gefilterd via de CSV)
+               - .gpx  -> alleen uitpakken/kopiëren
+               - .tcx  -> tcx_to_gpx()
+
+        work_dir is een tijdelijke map voor uitgepakte .gz bestanden
+        (standaard een auto-opgeruimde temp-map).
+
+        Geeft een dict terug met converted/skipped/failed tellers.
+        """
+        csv_path = Path(csv_path)
+        activities_dir = Path(activities_dir)
+        gpx_dir = Path(gpx_dir or self.data_source)
+        gpx_dir.mkdir(parents=True, exist_ok=True)
+
+        matched_activities = self.list_strava_export_activities(csv_path)
+
+        result = {"converted": 0, "skipped": 0, "failed": 0}
+
+        use_temp_dir = work_dir is None
+        work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="strava_export_"))
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            for index, activity in enumerate(matched_activities, start=1):
+                activity_id = activity["id"]
+                filename = activity["filename"]
+
+                print(
+                    f"[{index}/{len(matched_activities)}] {activity_id} - "
+                    f"{activity['activity_type']} ({filename})"
+                )
+
+                if not filename:
+                    print("    OVERGESLAGEN: geen bestandsnaam in de export.")
+                    result["skipped"] += 1
+                    continue
+
+                # De CSV verwijst meestal naar "activities/<bestand>";
+                # we pakken alleen de bestandsnaam en zoeken die in
+                # activities_dir, met een fallback op het volledige
+                # (relatieve) pad zoals in de CSV staat.
+                src_path = activities_dir / Path(filename).name
+                if not src_path.exists():
+                    fallback_path = Path(filename)
+                    if not fallback_path.is_absolute():
+                        fallback_path = activities_dir.parent / filename
+                    if fallback_path.exists():
+                        src_path = fallback_path
+
+                if not src_path.exists():
+                    print(f"    FOUT: bronbestand niet gevonden ({filename}).")
+                    result["failed"] += 1
+                    continue
+
+                gpx_output = gpx_dir / f"{activity_id}.gpx"
+                if gpx_output.exists():
+                    print(f"    Already exists: {gpx_output.name}")
+                    result["skipped"] += 1
+                    continue
+
+                try:
+                    extracted_path = self._maybe_decompress(src_path, work_dir)
+                    suffix = extracted_path.suffix.lower()
+
+                    if suffix == ".fit":
+                        converted = self.fit_to_gpx(extracted_path, gpx_output, check_sport=False)
+                        if not converted:
+                            result["skipped"] += 1
+                            continue
+                    elif suffix == ".gpx":
+                        shutil.copy2(extracted_path, gpx_output)
+                        print(f"    OK: {src_path.name} -> {gpx_output.name}")
+                    elif suffix == ".tcx":
+                        self.tcx_to_gpx(extracted_path, gpx_output)
+                        print(f"    OK: {src_path.name} -> {gpx_output.name}")
+                    else:
+                        print(f"    OVERGESLAGEN: onbekende extensie '{suffix}'.")
+                        result["skipped"] += 1
+                        continue
+
+                    result["converted"] += 1
+
+                except Exception as e:
+                    result["failed"] += 1
+                    print(f"    ERROR: {e}")
+        finally:
+            if use_temp_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+        print(
+            f"Strava bulk-export import klaar: {result['converted']} geconverteerd, "
+            f"{result['skipped']} overgeslagen, {result['failed']} mislukt."
+        )
+        return result
+
+    def sync_from_strava_export(self, csv_path, activities_dir="StravaExport/activities", gpx_dir=None):
+        """
+        Voert import_strava_bulk_export() uit en zet self.data_source
+        op de resulterende gpx-map, zodat run() / load_data() deze
+        meteen kan gebruiken.
+        """
+        gpx_dir = Path(gpx_dir or self.data_source)
+        self.import_strava_bulk_export(csv_path=csv_path, activities_dir=activities_dir, gpx_dir=gpx_dir)
         self.data_source = str(gpx_dir)
         return self
 
@@ -775,19 +1215,24 @@ class CyclingMovementRenderer:
 
         return self._strava_access_token
 
-    def list_strava_activities(self, start_date, cycling_only=True):
+    def list_strava_activities(self, start_date, filter_by_mode=True):
         """
         Haalt via de officiële Strava API alle activiteiten op vanaf
         start_date ("YYYY-MM-DD") tot nu, met paginering.
 
-        cycling_only=True filtert op fiets-gerelateerde sport_type
-        waardes (Ride, GravelRide, MountainBikeRide, VirtualRide, etc).
+        filter_by_mode=True (standaard) filtert op sport_type-waardes
+        die overeenkomen met self.activity_filter ("cycling": Ride,
+        GravelRide, MountainBikeRide, VirtualRide, etc; "running":
+        Run, TrailRun, VirtualRun). Zet op False om alle activiteiten
+        terug te krijgen, ongeacht sporttype.
 
         Geeft een lijst met dicts terug: {"id", "name", "start_date",
         "sport_type"}.
         """
         start_datetime = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         after_epoch = int(start_datetime.timestamp())
+
+        mode_types = self.STRAVA_CYCLING_TYPES if self.activity_filter == "cycling" else self.STRAVA_RUNNING_TYPES
 
         activities = []
         page = 1
@@ -810,7 +1255,7 @@ class CyclingMovementRenderer:
             for activity in batch:
                 sport_type = (activity.get("sport_type") or activity.get("type") or "").lower()
 
-                if cycling_only and "ride" not in sport_type and "cycl" not in sport_type:
+                if filter_by_mode and sport_type not in mode_types:
                     continue
 
                 activities.append(
@@ -828,7 +1273,8 @@ class CyclingMovementRenderer:
             page += 1
             time.sleep(self.strava_request_delay)
 
-        print(f"Totaal gevonden: {len(activities)} {'fiets' if cycling_only else ''}activiteiten sinds {start_date}.")
+        mode_label = f"{self.activity_filter}-" if filter_by_mode else ""
+        print(f"Totaal gevonden: {len(activities)} {mode_label}activiteiten sinds {start_date}.")
         return activities
 
     def _get_strava_activity_streams(self, activity_id):
@@ -891,7 +1337,7 @@ class CyclingMovementRenderer:
         output_path.write_text(gpx.to_xml(), encoding="utf-8")
         return True
 
-    def download_strava_cycling_activities(self, start_date, gpx_dir=None):
+    def download_strava_activities(self, start_date, gpx_dir=None):
         """
         Haalt fietsactiviteiten op van Strava (volledig via de
         officiële API: activiteitenlijst + streams) en schrijft ze
@@ -902,7 +1348,7 @@ class CyclingMovementRenderer:
         gpx_dir = Path(gpx_dir or self.data_source)
         gpx_dir.mkdir(parents=True, exist_ok=True)
 
-        activities = self.list_strava_activities(start_date, cycling_only=True)
+        activities = self.list_strava_activities(start_date, filter_by_mode=True)
 
         result = {"downloaded": 0, "skipped": 0, "failed": 0}
 
@@ -941,7 +1387,7 @@ class CyclingMovementRenderer:
         zodat run() / load_data() deze meteen kan gebruiken.
         """
         gpx_dir = Path(gpx_dir or self.data_source)
-        self.download_strava_cycling_activities(start_date=start_date, gpx_dir=gpx_dir)
+        self.download_strava_activities(start_date=start_date, gpx_dir=gpx_dir)
         self.data_source = str(gpx_dir)
         return self
 
@@ -950,16 +1396,10 @@ class CyclingMovementRenderer:
     # ------------------------------------------------------------
     def load_data(self):
         """
-        Leest self.data_source in, ongeacht of dit een map met .gpx
-        bestanden is, een .gpkg bestand, of een ander vector-bestand
-        (bv. .geojson). Vult self.lines met LineStrings in EPSG:3857.
+        Leest alle .gpx bestanden in self.data_source in. Vult
+        self.lines met LineStrings in EPSG:3857.
         """
-        if os.path.isdir(self.data_source):
-            gdf = self._read_gpx_folder(self.data_source)
-        elif self.data_source.lower().endswith(".gpkg"):
-            gdf = self._read_geopackage(self.data_source)
-        else:
-            gdf = gpd.read_file(self.data_source)
+        gdf = self._read_gpx_folder(self.data_source)
 
         gdf = gdf.to_crs(3857)
         self.gdf = gdf
@@ -990,7 +1430,13 @@ class CyclingMovementRenderer:
         """
         gpx_files = sorted(glob.glob(os.path.join(folder_path, "*.gpx")))
         if not gpx_files:
-            raise FileNotFoundError(f"Geen .gpx bestanden gevonden in {folder_path}")
+            raise FileNotFoundError(
+                f"Geen .gpx bestanden gevonden in {folder_path}. "
+                "Eerste keer dat je dit draait? Vul deze map eerst met "
+                "sync_from_tredict(), sync_from_strava() of "
+                "sync_from_strava_export() voordat je load_data()/run() "
+                "aanroept."
+            )
 
         gdfs = []
         for gpx_file in gpx_files:
@@ -1008,23 +1454,6 @@ class CyclingMovementRenderer:
 
         combined = pd.concat(gdfs, ignore_index=True)
         return gpd.GeoDataFrame(combined, geometry="geometry", crs=gdfs[0].crs)
-
-    @staticmethod
-    def _read_geopackage(gpkg_path, layer=None):
-        """
-        Leest een .gpkg bestand in. Als er meerdere layers in zitten
-        en er geen layer is opgegeven, wordt de eerste layer gebruikt.
-        """
-        if layer is not None:
-            return gpd.read_file(gpkg_path, layer=layer)
-
-        layers = gpd.list_layers(gpkg_path)
-        if len(layers) > 1:
-            print(
-                f"Waarschuwing: {gpkg_path} bevat meerdere layers "
-                f"({list(layers['name'])}), eerste layer wordt gebruikt."
-            )
-        return gpd.read_file(gpkg_path)
 
     # ------------------------------------------------------------
     # Figure + basemap
@@ -1184,12 +1613,17 @@ class CyclingMovementRenderer:
     # ------------------------------------------------------------
     # Video bouwen met ffmpeg
     # ------------------------------------------------------------
-    def build_video(self):
+    def build_video(self, output_video):
         """
         Bouwt de video van de gerenderde JPG-frames met imageio +
         imageio-ffmpeg (pip install imageio imageio-ffmpeg). Dit
         gebruikt een door pip meegeleverde ffmpeg-binary, dus geen
         handmatig ffmpeg-pad meer nodig.
+
+        output_video: bestandsnaam/pad van de te schrijven video
+        (bv. "cycling_movement2.mp4"). Verplicht - net als output_pdf
+        bij export_a0_map() en output_html bij export_folium_map(),
+        heeft dit geen default.
         """
         frame_files = sorted(glob.glob(os.path.join(self.frames_dir, "frame_*.jpg")))
         if not frame_files:
@@ -1216,11 +1650,11 @@ class CyclingMovementRenderer:
             writer_kwargs["ffmpeg_params"] = []  # placeholder, zie opmerking hieronder
             os.environ["IMAGEIO_FFMPEG_EXE"] = self.ffmpeg_path
 
-        with imageio.get_writer(self.output_video, **writer_kwargs) as writer:
+        with imageio.get_writer(output_video, **writer_kwargs) as writer:
             for frame_file in frame_files:
                 writer.append_data(imageio.imread(frame_file))
 
-        print(f"Done: {self.output_video}")
+        print(f"Done: {output_video}")
         return self
 
     # ------------------------------------------------------------
@@ -1315,13 +1749,24 @@ class CyclingMovementRenderer:
         line_color="red",
         line_weight=3,
         zoom_start=12,
+        today=None,
+        show_extent_info=True,
     ):
         """
         Maakt een eenvoudige interactieve HTML-kaart (folium) met alle
-        routes uit self.gdf erop. Vereist dat load_data() al is
+        routes uit self.gdf erop, plus dezelfde "Last Updated"-label
+        (linksboven) als de video. Vereist dat load_data() al is
         aangeroepen. Gebruikt dezelfde tile-bron als de rest van de
         klasse: Thunderforest als er een api_key is opgegeven, anders
         de gratis OsmAnd HD-tileserver.
+
+        show_extent_info=True (standaard) toont rechtsboven een label
+        met de geconfigureerde extent (self.xmin/ymin/xmax/ymax,
+        omgezet van EPSG:3857 naar lat/lon) en de opgegeven
+        zoom_start. Let op: m.fit_bounds() (hieronder) laat de browser
+        de uiteindelijke zoom automatisch herberekenen op basis van de
+        route-data, dus zoom_start is het gevraagde startniveau, niet
+        per se de zoom die je meteen te zien krijgt.
         """
         try:
             import folium
@@ -1369,6 +1814,90 @@ class CyclingMovementRenderer:
         # Automatisch inzoomen op de volledige extent van de routes
         m.fit_bounds([[miny, minx], [maxy, maxx]])
 
+        # "Last Updated"-label linksboven, zelfde stijl (afgeronde,
+        # lichtgrijze, halftransparante box) als add_last_updated_label()
+        # bij de video.
+        today = today or date.today().strftime("%Y-%m-%d")
+        last_updated_html = f"""
+        <div style="
+            position: fixed;
+            top: 10px; left: 50px;
+            z-index: 9999;
+            background-color: lightgrey;
+            opacity: 0.85;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: sans-serif;
+        ">
+            Last Updated: {today}
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(last_updated_html))
+
+        if show_extent_info:
+            # self.xmin/ymin/xmax/ymax staan al in EPSG:3857 (meters),
+            # dus die gebruiken we direct als initiële waarde voordat
+            # het JS-onderdeel hieronder 'm live overneemt.
+            extent_info_html = f"""
+            <div id="extent-info-box" style="
+                position: fixed;
+                top: 10px; right: 10px;
+                z-index: 9999;
+                background-color: lightgrey;
+                opacity: 0.85;
+                padding: 6px 12px;
+                border-radius: 8px;
+                font-size: 13px;
+                font-family: sans-serif;
+                line-height: 1.4;
+                white-space: nowrap;
+            ">
+                Extent (EPSG:3857): {self.xmin:.1f}, {self.ymin:.1f}, {self.xmax:.1f}, {self.ymax:.1f}<br>
+                Zoom: {zoom_start}
+            </div>
+            """
+            m.get_root().html.add_child(folium.Element(extent_info_html))
+
+            # Live bijwerken bij pannen/zoomen: leest de daadwerkelijk
+            # zichtbare kaart-extent (Leaflet geeft lat/lon terug) en
+            # projecteert die terug naar EPSG:3857-meters via
+            # Leaflet's eigen L.CRS.EPSG3857.project() - geen aparte
+            # projectie-library nodig. m.get_name() geeft de
+            # JS-variabelenaam van de folium-map terug. We wachten op
+            # het 'load'-event van de pagina (i.p.v. dit script direct
+            # te laten draaien) zodat de kaart en tile-layer
+            # gegarandeerd al bestaan, ongeacht de exacte volgorde
+            # waarin folium script-secties samenvoegt; anders kan de
+            # kaart zelf blanco/wit blijven.
+            map_var = m.get_name()
+            extent_update_js = f"""
+            window.addEventListener('load', function() {{
+                try {{
+                    var mapObj = {map_var};
+                    function updateExtentInfo() {{
+                        var bounds = mapObj.getBounds();
+                        var zoom = mapObj.getZoom();
+                        var sw3857 = L.CRS.EPSG3857.project(bounds.getSouthWest());
+                        var ne3857 = L.CRS.EPSG3857.project(bounds.getNorthEast());
+                        var el = document.getElementById('extent-info-box');
+                        if (el) {{
+                            el.innerHTML =
+                                "Extent (EPSG:3857): " + sw3857.x.toFixed(1) + ", " + sw3857.y.toFixed(1) +
+                                ", " + ne3857.x.toFixed(1) + ", " + ne3857.y.toFixed(1) +
+                                "<br>Zoom: " + zoom;
+                        }}
+                    }}
+                    mapObj.on('moveend', updateExtentInfo);
+                    mapObj.on('zoomend', updateExtentInfo);
+                    updateExtentInfo();
+                }} catch (e) {{
+                    console.error("Extent-info label kon niet worden bijgewerkt:", e);
+                }}
+            }});
+            """
+            m.get_root().script.add_child(folium.Element(extent_update_js))
+
         m.save(output_html)
         print(f"Folium-kaart opgeslagen als: {output_html}")
         return self
@@ -1376,7 +1905,11 @@ class CyclingMovementRenderer:
     # ------------------------------------------------------------
     # Alles in één keer uitvoeren
     # ------------------------------------------------------------
-    def run(self):
+    def run(self, output_video):
+        """
+        Ketent load_data() -> ... -> build_video(). output_video is
+        verplicht, zie build_video().
+        """
         (
             self.load_data()
             .setup_figure()
@@ -1384,70 +1917,129 @@ class CyclingMovementRenderer:
             .add_last_updated_label()
             .compute_frame_count()
             .render_frames()
-            .build_video()
+            .build_video(output_video)
         )
         return self
 
 #%%
-if __name__ == "__main__":
-    # data_source mag een .geojson, .gpkg, of een map met .gpx bestanden zijn:
-    renderer = CyclingMovementRenderer(
-        data_source="Activities_gpx",
-        # data_source="all_tracks.gpkg",
-        # data_source="gpx_tracks/",
-        ##ffmpeg_path=r"C:\Users\harke007\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.1-full_build-shared\bin\ffmpeg.exe",
-        api_key="6a53e8b25d114a5e9216df5bf9b5e9c8",
-        extent=(566922.7716, 6772346.9800, 702660.2619, 6873108.8243),
-        # Alleen nodig als je sync_from_tredict() / 
-        # download_tredict_cycling_activities() gebruikt. Zet je token
-        # liever in een environment variable dan hardcoded in het script:
-        tredict_token="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJyYndlblJ4aFV2TFVlVHBjNEhFZ3ZGIiwiaWF0IjoxNzg4MTk2ODczLCJleHAiOjMwNDk2MzY4NzMsInRyZWRpY3RVc2VySWQiOiJBbnJzMHROMWEiLCJwZXJzb25hbEFwaSI6dHJ1ZSwic2NvcGVzIjoiYWN0aXZpdHlSZWFkLGFjdGl2aXR5V3JpdGUsYm9keXZhbHVlc1JlYWQsYm9keXZhbHVlc1dyaXRlIn0.4LKy_yG8h8iDUHcsUnulxJCDKyVyd7NEPmGAn-iVyjk",#os.environ.get("TREDICT_TOKEN"),
-        fit_dir="Activities_fit",
-        # Alleen nodig als je sync_from_strava() /
-        # download_strava_cycling_activities() gebruikt. Aan te maken
-        # via https://www.strava.com/settings/api. Zet ze liever in
-        # environment variables dan hardcoded in het script:
-        strava_client_id="276202",#os.environ.get("STRAVA_CLIENT_ID"),
-        strava_client_secret="0307c0ceeb2f5950b1dcd6a694554ba60019dfde",#os.environ.get("STRAVA_CLIENT_SECRET"),
-        strava_refresh_token="e64fe7ab9b3bf0a09798b43e5f8a19587b8d3eaf"#os.environ.get("STRAVA_REFRESH_TOKEN"),
+os.chdir("youworkingdirectory")
+
+# ==============================================================
+# Stap 1: renderer initialiseren met alleen extent + activity_filter
+# ==============================================================
+# data_source laten we leeg: die wordt automatisch
+# "Activities_gpx_cycling" (of "Activities_gpx_running" bij
+# activity_filter="running"), en meteen aangemaakt als hij nog
+# niet bestaat. api_key laten we ook leeg -> gratis OpenStreetMap
+# basemap. Beide kun je hieronder alsnog overschrijven indien
+# gewenst (bv. renderer.api_key = "..." voor Thunderforest).
+#
+# De extent hieronder is een startpunt (goed voor fietsen rondom
+# Wageningen) - in stap 4 kun je 'm interactief verfijnen.
+renderer = CyclingMovementRenderer(
+    extent=(566922.7716, 6772346.9800, 702660.2619, 6873108.8243),
+    activity_filter="cycling",  # of "running"
+)
+
+# ==============================================================
+# Stap 2: kies ÉÉN manier om de gpx-map te (laten) vullen
+# ==============================================================
+# Opties: "existing_gpx" / "fit_folder" / "tredict" /
+#         "strava_bulk_export" / "strava_api"
+DATA_SOURCE_MODE = "strava_bulk_export"
+
+if DATA_SOURCE_MODE == "existing_gpx":
+    # De gpx-map (renderer.data_source) is al gevuld -> niets te
+    # doen, load_data() hieronder leest 'm gewoon in.
+    pass
+
+elif DATA_SOURCE_MODE == "fit_folder":
+    # We hebben een map met alleen .fit bestanden (bv. een bulk-
+    # export vanuit Garmin) -> converteren naar .gpx in
+    # renderer.data_source.
+    renderer.convert_fit_folder_to_gpx(fit_dir="Activities_fit")
+
+elif DATA_SOURCE_MODE == "tredict":
+    # Vult de gpx-map aan met nieuwe activiteiten van Tredict
+    # vanaf start_date. Zet je token liever in een environment
+    # variable dan hardcoded in het script:
+    renderer.tredict_token = os.environ.get("TREDICT_TOKEN")
+    renderer.sync_from_tredict(start_date="2026-08-01")
+
+elif DATA_SOURCE_MODE == "strava_bulk_export":
+    # Verwerkt een Strava bulk-export (aangevraagd via je
+    # accountinstellingen -> "Download of verwijder je account" ->
+    # "Alle je activiteiten downloaden"). Pak de export folder uit en hernoem hem StravaExport
+    # Verwacht activities.csv plus de map StravaExport/activities met de originele
+    # .fit/.gpx/.tcx (evt. .gz-gecomprimeerde) bestanden:
+    renderer.sync_from_strava_export(
+        csv_path="StravaExport/activities.csv",
+        activities_dir="StravaExport/activities",
     )
 
-    # Alleen de video renderen (met wat al in Activities_gpx staat):
-    renderer.run()
+elif DATA_SOURCE_MODE == "strava_api":
+    # Vult de gpx-map aan met nieuwe activiteiten van Strava
+    # vanaf start_date, volledig via de officiële API
+    # (activiteitenlijst + streams). Vereist het pakket stravalib
+    # voor de OAuth-token-uitwisseling. Aan te maken via
+    # https://www.strava.com/settings/api; zet ze liever in
+    # environment variables dan hardcoded in het script:
+    renderer.strava_client_id = os.environ.get("STRAVA_CLIENT_ID")
+    renderer.strava_client_secret = os.environ.get("STRAVA_CLIENT_SECRET")
+    renderer.strava_refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN")
+    renderer.sync_from_strava(start_date="2026-08-01")
 
-    # Of eerst nieuwe fietsactiviteiten van Tredict downloaden (.fit),
-    # omzetten naar .gpx in de Activities_gpx map, en die daarna
-    # gebruiken voor de video:
-    # renderer.sync_from_tredict(start_date="2026-08-01")
-    # renderer.run()
+else:
+    raise ValueError(f"Onbekende DATA_SOURCE_MODE: {DATA_SOURCE_MODE!r}")
 
-    # Of de twee stappen los van elkaar:
-    # renderer.download_tredict_cycling_activities(start_date="2026-08-01")
-    # renderer.convert_fit_folder_to_gpx()
-    # renderer.run()
+# ==============================================================
+# Stap 3: data inladen (nodig voor elke output hieronder)
+# ==============================================================
+renderer.load_data()
 
-    # Of eerst interactief de bbox kiezen op basis van de geladen data:
-    # renderer.load_data().define_bbox_interactively(zoom=10)
-    # renderer.run()
+# ==============================================================
+# Stap 4: extent interactief verfijnen via de folium-kaart
+# ==============================================================
+# Open Routes_explore.html in je browser, pan/zoom naar het
+# gebied dat je wil gebruiken, en lees rechtsboven het live
+# "Extent (EPSG:3857): xmin, ymin, xmax, ymax"-label af (dit
+# label update automatisch bij pannen/zoomen, en is als kant-en-
+# klare komma-gescheiden tuple te kopiëren-plakken).
+#
+# Zet UPDATE_EXTENT op False om de extent uit stap 1 te laten
+# staan (bv. als je 'm al goed hebt), of op True en vul
+# update_extent hieronder met de gekopieerde waardes in om 'm aan
+# te passen vóór het renderen van video/poster/definitieve kaart.
+renderer.export_folium_map(output_html="Routes_explore.html")
 
-    # Of alleen de A0-poster, op basis van dezelfde geladen data:
-    # renderer.load_data().export_a0_map(
-    #     output_pdf="Routes.pdf",
-    #     zoom=13,
-    # )
+UPDATE_EXTENT = False
+if UPDATE_EXTENT:
+    update_extent = (600680.4, 6790015.9, 666416.2, 6814303.7)  # <- plak hier je gekopieerde extent
+    renderer.xmin, renderer.ymin, renderer.xmax, renderer.ymax = update_extent
 
-    # Of een simpele interactieve HTML-kaart met alle routes:
-    # renderer.load_data().export_folium_map(
-    #     output_html="Routes.html",
-    # )
+# ==============================================================
+# Stap 5: kies welke output(s) je wil draaien - meerdere mag
+# ==============================================================
+# Deze gebruiken de (eventueel bijgewerkte) extent uit stap 4.
+# export_folium_map() hier is de DEFINITIEVE kaart (Routes.html,
+# dus een andere bestandsnaam dan de verkenner uit stap 4).
+RUN_VIDEO = True
+RUN_FOLIUM_MAP = True
+RUN_A0_POSTER = True
 
-    # Of eerst nieuwe fietsactiviteiten van Strava downloaden als
-    # .gpx, volledig via de officiële API (activiteitenlijst +
-    # streams, zie de Strava-sectie in de klasse):
-    renderer.sync_from_strava(start_date="2026-08-31")
-    # renderer.run()
+if RUN_VIDEO:
+    (
+        renderer
+        .setup_figure()
+        .create_layers()
+        .add_last_updated_label()
+        .compute_frame_count()
+        .render_frames()
+        .build_video(output_video="CyclingMovements.mp4")
+    )
 
-    # Of alleen de activiteiten lijsten (zonder te downloaden):
-    # activities = renderer.list_strava_activities(start_date="2026-08-01")
-    # for a in activities:
-    #     print(a["id"], a["start_date"], a["name"])
+if RUN_FOLIUM_MAP:
+    renderer.export_folium_map(output_html="CyclingRoutes.html")
+
+if RUN_A0_POSTER:
+    renderer.export_a0_map(output_pdf="CyclingRoutes.pdf")
