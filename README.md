@@ -68,8 +68,8 @@ Dit zijn de variabelen die (afhankelijk van welke databron je gebruikt) nodig ku
 | `STRAVA_CLIENT_ID` | `sync_from_strava()` / `download_strava_activities()` | [strava.com/settings/api](https://www.strava.com/settings/api) |
 | `STRAVA_CLIENT_SECRET` | idem | idem |
 | `STRAVA_REFRESH_TOKEN` | idem | Zie [Strava OAuth](#strava-oauth-refresh_token-verkrijgen) — **niet** het standaardtoken van de instellingenpagina |
-
-Nodig je alleen `sync_from_strava_export()` (de bulk-export) of `convert_fit_folder_to_gpx()`? Dan zijn deze variabelen niet nodig.
+| `THUNDERFOREST_TOKEN` | Achtergrond kaar | Je Thunderforest API Key, als je niet de standaard OSM basemap gebruikt |
+Gebruik je alleen de methodes `sync_from_strava_export()` (de bulk-export) of `convert_fit_folder_to_gpx()`? Dan zijn deze variabelen niet nodig.
 
 ### Windows: `set_env_vars.bat`
 
