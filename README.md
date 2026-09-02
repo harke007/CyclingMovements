@@ -297,7 +297,7 @@ renderer.export_a0_map(output_pdf="Routes.pdf")
 
 Rendert alle routes **volledig getekend** (geen animatie) op een A0-formaat PDF (841 × 1189 mm, 300 dpi) met dezelfde achtergrondkaart.
 
-Parameters: `output_pdf`, `zoom` (tile-zoomniveau, los van het video-`zoom`), `line_color`, `line_width`, `margin` (extra marge rond de extent).
+Parameters: `output_pdf`, `dpi` ,`zoom` (tile-zoomniveau, los van het video-`zoom`), `line_color`, `line_width`, `margin` (extra marge rond de extent).
 
 ---
 
