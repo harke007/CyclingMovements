@@ -1684,8 +1684,13 @@ class CyclingMovementRenderer:
         lines = lines.to_crs(epsg=3857)
 
         # ------------------------------------------------------------
-        # Extent met marge rondom de opgegeven bounding box
+        # A0 afmetingen in inches (841 x 1189 mm), liggend
         # ------------------------------------------------------------
+        a0_width = 1189 / 25.4
+        a0_height = 841 / 25.4
+        a0_aspect_ratio = a0_width / a0_height
+
+        # Extent met marge rondom de opgegeven bounding box
         width = self.xmax - self.xmin
         height = self.ymax - self.ymin
 
@@ -1694,12 +1699,28 @@ class CyclingMovementRenderer:
         ymin = self.ymin - height * margin
         ymax = self.ymax + height * margin
 
-        # ------------------------------------------------------------
-        # A0 afmetingen in inches (841 x 1189 mm)
-        # ------------------------------------------------------------
-        a0_width = 1189 / 25.4
-        a0_height = 841 / 25.4
+        # Vul de kortste dimensie aan zodat de kaart niet vervormt op
+        # het A0-landscape papier. De extent blijft gecentreerd.
+        width = xmax - xmin
+        height = ymax - ymin
+        extent_aspect_ratio = width / height
+        center_x = (xmin + xmax) / 2
+        center_y = (ymin + ymax) / 2
+        
 
+        if extent_aspect_ratio > a0_aspect_ratio:
+            height = width / a0_aspect_ratio
+        else:
+            width = height * a0_aspect_ratio
+
+        xmin = center_x - width / 2
+        xmax = center_x + width / 2
+        ymin = center_y - height / 2
+        ymax = center_y + height / 2
+
+        # ------------------------------------------------------------
+        # Figuur op A0-formaat
+        # ------------------------------------------------------------
         fig = plt.figure(figsize=(a0_width, a0_height), dpi=dpi)
 
         # Volledig full-page axes
@@ -1733,7 +1754,7 @@ class CyclingMovementRenderer:
             output_pdf,
             format="pdf",
             dpi=dpi,
-            bbox_inches=None,
+            bbox_inches='tight',
             pad_inches=0,
         )
 
@@ -1923,7 +1944,7 @@ class CyclingMovementRenderer:
         return self
 
 #%%
-os.chdir("youworkingdirectory")
+os.chdir(r"C:\Users\harke007\RouteMap\Git")
 
 # ==============================================================
 # Stap 1: renderer initialiseren met alleen extent + activity_filter
@@ -2015,7 +2036,9 @@ renderer.export_folium_map(output_html="Routes_explore.html")
 
 UPDATE_EXTENT = False
 if UPDATE_EXTENT:
-    update_extent = (600680.4, 6790015.9, 666416.2, 6814303.7)  # <- plak hier je gekopieerde extent
+
+    update_extent = (596858.5, 6776563.0, 662517.9, 6825100.5)
+    #update_extent = (600680.4, 6790015.9, 666416.2, 6814303.7)  # <- plak hier je gekopieerde extent
     renderer.xmin, renderer.ymin, renderer.xmax, renderer.ymax = update_extent
 
 # ==============================================================
@@ -2036,11 +2059,12 @@ if RUN_VIDEO:
         .add_last_updated_label()
         .compute_frame_count()
         .render_frames()
-        .build_video(output_video="CyclingMovements.mp4")
+        .build_video(output_video="RunningMovements.mp4")
     )
 
 if RUN_FOLIUM_MAP:
-    renderer.export_folium_map(output_html="CyclingRoutes.html")
+    renderer.export_folium_map(output_html="RunningRoutes.html")
 
 if RUN_A0_POSTER:
-    renderer.export_a0_map(output_pdf="CyclingRoutes.pdf")
+    renderer.export_a0_map(output_pdf="RunningRoutes6.pdf")
+    
